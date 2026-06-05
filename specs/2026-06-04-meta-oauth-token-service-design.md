@@ -59,61 +59,79 @@ alive. Concretely:
 
 | Decision             | Choice                                                                                                                                                                | Rationale                                                                                          |
 | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| Agency scope         | `agency_id` is a first-class scoping column (nullable, no FK); **multiple agencies per tenant DB**, each with its own connection; one row per Page/IG                 | Tenant ≠ agency; no agency entity exists to FK to yet                                              |
-| Token storage        | **Single flat table** `agency_social_connections`, one row per Page/IG; per-agency user-token/expiry/warning fields carried on the rows (updated together per agency) | Matches industry norm (Postiz, Mixpost); page tokens don't expire so per-page lifecycle is minimal |
+| Agency scope         | `agency_id` is a first-class scoping column (no FK); **multiple agencies per tenant DB**, each with its own connection                 | Tenant ≠ agency; no agency entity exists to FK to yet                                              |
+| Token storage        | **Two tables (normalized):** `agency_social_connections` (one row per agency — the user-token lifecycle) + `agency_social_accounts` (one row per Page/IG — its own page token). See §4 | A flat table duplicated the per-agency user token across every Page row, making refresh/health hard to reason about; splitting puts the lifecycle in one place. Mixpost's per-account fields (provider/provider_id unique, own access_token) inform the accounts table |
 | Encryption           | **Base64 obfuscation** (match existing pattern)                                                                                                                       | Consistency with all other Slate credential stores                                                 |
 | Expiry notifications | **In-app banner state** (connection row)                                                                                                                              | No generic notification subsystem to build                                                         |
 | Refresh failure      | **Explicit reconnect notification to agency admin**                                                                                                                   | Silent refresh can't always succeed; admin must re-auth                                            |
 | Meta API client      | **Small in-repo "SDK-lite"** (`httpx`), no third-party SDK                                                                                                            | `facebook-sdk` unmaintained; `facebook_business` too heavy; matches `tallbob.py`                   |
 | Tests                | **Integration tests for the background job only** (no unit tests for now)                                                                                             | Per scope request                                                                                  |
 
-## 4. Data model — `agency_social_connections` (single flat table)
+## 4. Data model — two normalized tables
 
-One table, one Alembic migration, rolled out to every tenant + `slate_template` via
-`scripts/migrate_all_tenants.py` (per `CLAUDE.md`). One **row per connected entity** — a
-Facebook Page (`platform=facebook`) or an Instagram account (`platform=instagram`) — which
-matches the industry norm (Postiz, Mixpost both use a single flat accounts/integration
-table). Because **Page tokens derived from a long-lived user token don't expire**, the
-only thing with a real lifecycle is the **per-agency user token**; its fields are carried
-on the connection rows and updated together per agency.
+Two tables, one Alembic migration, rolled out to every tenant + `slate_template` via
+`scripts/migrate_all_tenants.py` (per `CLAUDE.md`). The earlier single flat table copied
+the per-agency **user token** (and its expiry/status/warning) onto every Page row, so a
+two-Page agency held two copies that had to stay in sync on every refresh — awkward to
+reason about. We split that into:
+
+- **`agency_social_connections`** — the OAuth login, **one row per agency**: the
+  long-lived **user** token and its lifecycle (expiry, status, warning level). This is the
+  single row the daily job reads and writes.
+- **`agency_social_accounts`** — the assets, **one row per Page/IG**: the entity's own
+  **page** token, FK → its connection. Shape informed by Mixpost's `mixpost_accounts`
+  (`provider`/`provider_id` unique, per-account `access_token`).
+
+Because **Page tokens derived from a long-lived user token don't expire**, the accounts
+rows need no lifecycle of their own — only the connection's user token does.
+
+### 4.1 `agency_social_connections`
 
 | column | type | notes |
 |---|---|---|
 | `id` | UUID PK | `UUIDMixin` |
-| `agency_id` | string/UUID, nullable | **scoping key**; no enforced FK (no agency entity yet). Distinct values coexist in one tenant DB. Indexed |
-| `platform` | string | `facebook` \| `instagram` |
-| `page_id` | string, nullable | set on facebook rows |
-| `ig_account_id` | string, nullable | set on instagram rows |
-| `page_name` | string, nullable | |
-| `ig_username` | string, nullable | |
-| `access_token` | text | base64-obfuscated **page** token (IG operations also use the page token) |
-| `is_primary` | bool, default false | exactly one row per agency is primary; it anchors the agency's lifecycle/banner state. Set on the first Facebook Page |
-| `user_access_token` | text, nullable | base64-obfuscated long-lived **user** token — the agency-level value, the same across that agency's rows (used for silent refresh) |
-| `token_expires_at` | timestamptz, nullable | user-token expiry — the only token that expires; agency-level (same across rows) |
-| `warning_level` | smallint, default 0 | `0` = none, `14`, `5` — drives banner + dedupes warnings (read from the primary row) |
-| `status` | string | `connected` \| `expiring` \| `expired` \| `needs_reconnect` \| `error` (agency-level) |
-| `last_error` | text, nullable | agency-level refresh/connect errors, or per-page issues (e.g. IG lookup failed) |
+| `agency_id` | string, NOT NULL, **unique** | scoping key; no FK (no agency entity yet). One connection per agency. Indexed |
+| `user_access_token` | text, nullable | base64-obfuscated long-lived **user** token — the only token that expires |
+| `token_expires_at` | timestamptz, nullable | user-token expiry (~60 days) |
+| `status` | string | `connected` \| `expiring` \| `expired` \| `needs_reconnect` \| `error` |
+| `warning_level` | smallint, default 0 | `0` = none, `14`, `5` — drives banner + dedupes warnings |
+| `last_error` | text, nullable | last refresh/connect error |
 | `connected_by_user_id` | UUID, nullable, FK→`users.id` | who initiated the connect — preferred notification recipient |
-| `last_warned_at` | timestamptz, nullable | when the most recent expiry warning fired (informational; dedupe via `warning_level`) |
-| `connected_at` | timestamptz | |
+| `connected_at` | timestamptz, nullable | |
 | `last_refreshed_at` | timestamptz, nullable | |
+| `last_warned_at` | timestamptz, nullable | |
 | `created_at` / `updated_at` | timestamptz | `TimestampMixin` |
 
-**Agency-level vs per-row fields.** `access_token`, `page_id`/`ig_account_id`,
-`page_name`/`ig_username`, `is_primary` are **per row**. `user_access_token`,
-`token_expires_at`, `warning_level`, `status`, `connected_by_user_id`, `last_warned_at`,
-`last_refreshed_at` are **agency-level** — written identically across all of an agency's
-rows by the connect flow and the daily job (single `UPDATE … WHERE agency_id=…`). Reads
-of agency status/banner use the `is_primary` row to avoid ambiguity. This denormalization
-(a few duplicated columns across a handful of Page rows) is the deliberate trade for
-staying single-table; the alternative — a parent table — was considered and rejected in
-favour of the simpler, industry-standard shape.
+### 4.2 `agency_social_accounts`
 
-**Upsert key:** `(agency_id, platform, page_id)` (or `ig_account_id` for IG).
-Reconnecting refreshes tokens in place; disconnect deletes all rows for the `agency_id`.
-Index on `(agency_id)` and `(agency_id, is_primary)`.
+| column | type | notes |
+|---|---|---|
+| `id` | UUID PK | `UUIDMixin` |
+| `connection_id` | UUID, NOT NULL, FK→`agency_social_connections.id` **ON DELETE CASCADE** | parent connection. Indexed |
+| `agency_id` | string, NOT NULL | denormalized scope key (immutable) for single-table per-agency listing. Indexed |
+| `platform` | string | `facebook` \| `instagram` |
+| `provider_id` | string, NOT NULL | the platform's id — Page id (facebook) or IG account id |
+| `name` | string, nullable | page name / IG display name |
+| `username` | string, nullable | IG username |
+| `access_token` | text, nullable | base64-obfuscated **page** token (IG operations also use the page token); permanent while the user token is valid |
+| `is_primary` | bool, default false | the agency's primary Page — anchors banner/display |
+| `authorized` | bool, default true | cleared on an auth failure → reconnect (reactive health) |
+| `connected_at` | timestamptz, nullable | |
+| `created_at` / `updated_at` | timestamptz | `TimestampMixin` |
 
-Model: `src/models/agency_social_connection.py` (inherits `Base, UUIDMixin, TimestampMixin`).
+**Upsert key:** `UNIQUE(connection_id, platform, provider_id)` — reconnecting upserts the
+same Page/IG in place (no delete-all/re-insert). `UNIQUE(agency_id)` on the connection
+enforces one connection per agency. **Disconnect** deletes the connection row; the
+`ON DELETE CASCADE` removes its accounts. Indexes: `agency_id` (both tables),
+`connection_id` (accounts).
+
+**Deliberately deferred (YAGNI):** Mixpost's `data`/`media` JSON blobs (provider extras,
+avatar) — easy to add to `agency_social_accounts` later when we fetch Page pictures or
+need provider-specific metadata.
+
+Models: `src/models/agency_social_connection.py` and
+`src/models/agency_social_account.py` (both inherit `Base, UUIDMixin, TimestampMixin`,
+joined by a `connection.accounts` / `account.connection` relationship).
 
 ## 5. Meta API client — "SDK-lite"
 
@@ -160,12 +178,21 @@ sequenceDiagram
         BE->>M: get_ig_account(page_id, page_token)
         M-->>BE: {ig_id, username} or none
     end
-    BE->>DB: upsert rows (1/Page + 1/IG), mark first is_primary,<br/>write agency-level fields to all rows (user token, expiry, status=connected)
+    BE->>DB: insert 1 connection (user token, expiry, status=connected)<br/>+ 1 account/Page and 1 account/IG (page token; first Page is_primary)
     BE-->>U: HTML close-window page → window.opener.postMessage()
-    FE->>BE: GET /api/social/meta/connections (refresh UI)
+    FE->>BE: GET /api/social/meta/connection (refresh UI)
 ```
 
 ### Daily token monitor (flow)
+
+> ⚠️ **Pending re-sync (monitor milestone).** This flowchart and §7 below still describe the
+> pre-normalization flat model ("each agency `is_primary` row", "UPDATE all agency rows").
+> Under the two-table model the loop iterates **one connection per agency** and writes the
+> lifecycle fields to that single connection row. This section will be rewritten when the
+> monitor is implemented, together with the **refresh-strategy decision** (page tokens are
+> permanent while the user token is valid, and `fb_exchange_token` does not reset the 60-day
+> clock — so the loop is primarily warn-at-14/5 + reactive `needs_reconnect`, not a true
+> silent extension).
 
 ```mermaid
 flowchart TD
@@ -197,8 +224,11 @@ client-contract change. Generates a CSRF `state`, stores it tenant-side (short-l
 `app_settings` or a dedicated row) **bound to the resolved `agency_id`**, and returns the
 Facebook OAuth dialog URL with
 `redirect_uri = {PUBLIC_BASE_URL}/api/auth/meta/callback` and scopes:
-`pages_show_list`, `pages_read_engagement`, `pages_manage_metadata`,
-`business_management`, `instagram_basic`.
+`pages_show_list`, `pages_read_engagement`, `business_management`,
+`instagram_basic`. (`pages_manage_metadata` was dropped — Meta returns
+`Invalid Scopes` for it on this app type, and it isn't needed for the
+list-Pages / Page-token / read-IG flow; add Page-write scopes like
+`pages_manage_posts` later when posting is implemented.)
 
 ### 6.2 Callback — `GET /api/auth/meta/callback?code=&state=`
 **Unauthenticated** (`get_db` + cross-tenant `state` lookup, mirroring
@@ -208,35 +238,38 @@ Facebook OAuth dialog URL with
    on mismatch.
 2. `exchange_code` → short-lived user token.
 3. `exchange_for_long_lived` → long-lived user token; compute `token_expires_at`.
-4. `get_pages` → upsert an `agency_social_connections` row per Page (`platform=facebook`,
-   `access_token` = page token). Mark the first one `is_primary=true`.
-5. For each Page, `get_ig_account` → upsert a row when a linked IG **Business/Creator**
-   account is present (`platform=instagram`, `access_token` = page token). IG accounts are
-   auto-discovered here from the Page's `instagram_business_account` field (requires the IG
-   account to be a Business/Creator account linked to that Page and the `instagram_basic`
+4. **Replace** the agency's existing connection — `delete_by_agency` (the FK
+   `ON DELETE CASCADE` clears its accounts), then insert **one** `agency_social_connections`
+   row holding the agency-level fields (`user_access_token`, `token_expires_at`,
+   `status=connected`, `warning_level=0`, `connected_at`).
+5. `get_pages` → append one `agency_social_accounts` child per Page
+   (`platform=facebook`, `provider_id`=page id, `access_token` = page token). Mark the
+   first Page `is_primary=true`.
+6. For each Page, `get_ig_account` → append an account when a linked IG **Business/Creator**
+   account is present (`platform=instagram`, `provider_id`=IG id, `access_token` = page
+   token). IG accounts are auto-discovered here from the Page's `instagram_business_account`
+   field (requires a Business/Creator account linked to that Page and the `instagram_basic`
    scope granted). The explicit **Connect Instagram** button (§6.4) is gated behind a
    connected Facebook Page and makes this step user-triggerable/testable.
-6. Write the agency-level fields onto **all** of this agency's rows (`user_access_token`,
-   `token_expires_at`, `status=connected`, `warning_level=0`, `connected_by_user_id`) —
-   one `UPDATE … WHERE agency_id=…`.
 7. Return an HTML "you can close this window" page that `postMessage`s the opener
    (TradeMe pattern).
 
-All writes are scoped to the resolved `agency_id`, so connecting one agency never touches
-another agency's rows in the same tenant DB. On any failure: HTML error page; persist
-nothing half-written; if that agency already has rows, stamp `status=error` + `last_error`
-on them.
+All writes are scoped to the resolved `agency_id` (connection + its accounts), so connecting
+one agency never touches another agency's data in the same tenant DB. On any failure: HTML
+error page; the delete+insert run in one transaction so nothing is half-written.
 
 ### 6.3 Status / disconnect
 Both resolve the agency server-side (same as §6.1) — no client-supplied `agency_id` in v1.
-- `GET /api/social/meta/connections` — list the resolved agency's rows for the UI banner +
-  connection list. (When multi-agency lands, this returns the rows for each agency the
-  user can see.)
-- `DELETE /api/social/meta/connections` — disconnect: clear the resolved agency's rows.
+
+- `GET /api/social/meta/connection` — return the resolved agency's **single** connection
+  (status/expiry/warning_level + nested `accounts`), or `null`. Drives the UI banner +
+  account list. (When multi-agency lands, this becomes a list keyed by agency.)
+- `DELETE /api/social/meta/connection` — disconnect: delete the agency's connection (cascade
+  clears its accounts).
 
 Namespacing: the OAuth handshake uses **`/api/auth/meta/*`** (`connect`, `callback`) — the
 callback is unauthenticated and must match the redirect URI registered in the Meta app;
-the data/management endpoints stay under **`/api/social/meta/*`** (`connections`).
+the data/management endpoints stay under **`/api/social/meta/*`** (`connection`).
 Endpoints live in `src/api/meta_social.py`; routers registered in `src/main.py`.
 
 ### 6.4 Instagram connect — **depends on Facebook; minimal, for testing this phase**
@@ -253,15 +286,16 @@ exercised end-to-end; robustness/UX is **polished in the next task** (see §13).
   agency already has a connected Facebook Page (else 409/disabled). It re-runs the Meta
   OAuth requesting the Instagram scopes (`instagram_basic`; later
   `instagram_content_publish`) and, via the existing page tokens, resolves each Page's
-  linked IG Business account and upserts the `platform=instagram` rows (token = the Page
+  linked IG Business account and appends the `platform=instagram` accounts (token = the Page
   token). Reuses the §6.2 callback.
 - **Scoped down for now:** happy-path only, minimal error rendering, no IG-account picker.
   These are the "polish next task" items. (IG accounts are in fact already auto-derived
   during the Facebook connect in §6.2; this button just makes the step explicit/testable
   and requests the IG scopes.)
 
-This reuses the same single table, page tokens, and obfuscation helpers — no schema change,
-no separate IG token type.
+This reuses the same two tables, page tokens, and obfuscation helpers — IG accounts are just
+more `agency_social_accounts` children of the same connection: no schema change, no separate
+IG token type.
 
 ## 7. Daily background job — `src/services/meta_token_monitor.py`
 
@@ -316,11 +350,10 @@ continues to the next agency/tenant (watchdog pattern).
 
 All notifications are **per agency** (keyed by `agency_id`), not per tenant.
 
-- **In-app banner (expiry warnings):** no new table. State lives on the connection rows
-  (`status`, `warning_level`, `token_expires_at`), read from the agency's `is_primary` row.
-  `GET /api/social/meta/connections` returns it per agency; the Integrations/Settings
-  page renders a banner ("Meta connection expires in N days — reconnect") against the
-  affected agency.
+- **In-app banner (expiry warnings):** no new table. State lives on the **connection**
+  (`status`, `warning_level`, `token_expires_at`) — one row per agency.
+  `GET /api/social/meta/connection` returns it; the Integrations/Settings page renders a
+  banner ("Meta connection expires in N days — reconnect") against the affected agency.
 - **Reconnect notification (refresh failure):** when silent refresh fails, in addition
   to `status=needs_reconnect` and the banner, send the **agency admin** a "reconnect your
   Meta account" notification — via the existing `send_notification` path
@@ -354,7 +387,8 @@ A **Meta** tab under **Integrations** with a "Connected accounts" panel holding 
 - **Facebook** — "Publish posts to your Facebook Page", status pill (Not connected /
   Connected / Expiring / Needs reconnect), **Connect Facebook** button → opens
   `/api/auth/meta/connect` in a popup, listens for the `postMessage` completion, then
-  refreshes from `GET /api/social/meta/connections`.
+  refreshes from `GET /api/social/meta/connection`. Connected-state is derived from the
+  connection's nested `accounts` (a facebook account present ⇒ Facebook connected).
 - **Instagram** — **disabled/greyed out until a Facebook Page is connected**, with helper
   text "Connect your Facebook Page first" (the UI enforces the sequence — IG requires a
   linked FB Page). Once Facebook is connected, the **Connect Instagram** button enables and
@@ -363,9 +397,9 @@ A **Meta** tab under **Integrations** with a "Connected accounts" panel holding 
   next. (IG is also auto-derived during the Facebook connect in §6.2.)
 
 Both buttons share the popup + `postMessage` pattern. The expiry/reconnect banner is driven
-by the connection rows' `status`/`warning_level`. Register per `CLAUDE.md` (`App.tsx`,
-`Sidebar`, `ClientModeGuard`) if it's a new route; if it lives inside the existing
-Integrations page, only API wiring is new.
+by the connection's `status`/`warning_level` (one connection per agency). Register per
+`CLAUDE.md` (`App.tsx`, `Sidebar`, `ClientModeGuard`) if it's a new route; if it lives
+inside the existing Integrations page, only API wiring is new.
 
 ## 11. Testing
 

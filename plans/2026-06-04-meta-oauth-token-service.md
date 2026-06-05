@@ -74,81 +74,158 @@ git commit -m "feat(meta): add META_GRAPH_VERSION setting"
 
 ---
 
-### Task 2: Create the `AgencySocialConnection` model
+### Task 2: Create the `AgencySocialConnection` + `AgencySocialAccount` models
+
+> **As-built (normalized):** the per-agency **user-token lifecycle** lives in `agency_social_connections` (one row per agency); each Page/IG is a child row in `agency_social_accounts` (its own permanent page token), joined by a `connection.accounts` relationship. This replaced the earlier single flat table that duplicated the user token across every Page row. See spec §4.
 
 **Files:**
 - Create: `src/models/agency_social_connection.py`
+- Create: `src/models/agency_social_account.py`
 - Modify: `src/models/__init__.py`
 
-- [ ] **Step 1: Write the model**
+- [ ] **Step 1: Write the connection model (the OAuth login — one per agency)**
 
 Create `src/models/agency_social_connection.py`:
 
 ```python
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, SmallInteger, String, Text
+from sqlalchemy import (
+    DateTime,
+    ForeignKey,
+    SmallInteger,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.base import Base, TimestampMixin, UUIDMixin
+
+if TYPE_CHECKING:
+    from src.models.agency_social_account import AgencySocialAccount
 
 
 class AgencySocialConnection(Base, UUIDMixin, TimestampMixin):
     __tablename__ = "agency_social_connections"
-
-    agency_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
-    platform: Mapped[str] = mapped_column(String(20), nullable=False)
-    page_id: Mapped[Optional[str]] = mapped_column(String(100))
-    ig_account_id: Mapped[Optional[str]] = mapped_column(String(100))
-    page_name: Mapped[Optional[str]] = mapped_column(String(255))
-    ig_username: Mapped[Optional[str]] = mapped_column(String(255))
-    access_token: Mapped[Optional[str]] = mapped_column(Text)
-    is_primary: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, server_default="false"
+    __table_args__ = (
+        UniqueConstraint("agency_id", name="uq_agency_social_connections_agency"),
     )
+
+    agency_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     user_access_token: Mapped[Optional[str]] = mapped_column(Text)
     token_expires_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True)
     )
-    warning_level: Mapped[int] = mapped_column(
-        SmallInteger, nullable=False, server_default="0"
-    )
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, server_default="connected"
+    )
+    warning_level: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, server_default="0"
     )
     last_error: Mapped[Optional[str]] = mapped_column(Text)
     connected_by_user_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id")
     )
-    last_warned_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     connected_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     last_refreshed_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True)
     )
+    last_warned_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    accounts: Mapped[list["AgencySocialAccount"]] = relationship(
+        "AgencySocialAccount",
+        back_populates="connection",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
 ```
 
-- [ ] **Step 2: Register the model so `Base.metadata` includes the table**
+(Each column carries a short `comment=` in the as-built file; omitted here for brevity.)
 
-In `src/models/__init__.py`, add an import alongside the other model imports (so tests' `Base.metadata.create_all` builds the table):
+- [ ] **Step 2: Write the account model (one per Page/IG)**
+
+Create `src/models/agency_social_account.py`:
 
 ```python
-from src.models.agency_social_connection import AgencySocialConnection  # noqa: F401
+import uuid
+from datetime import datetime
+from typing import TYPE_CHECKING, Optional
+
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from src.models.base import Base, TimestampMixin, UUIDMixin
+
+if TYPE_CHECKING:
+    from src.models.agency_social_connection import AgencySocialConnection
+
+
+class AgencySocialAccount(Base, UUIDMixin, TimestampMixin):
+    __tablename__ = "agency_social_accounts"
+    __table_args__ = (
+        UniqueConstraint(
+            "connection_id",
+            "platform",
+            "provider_id",
+            name="uq_agency_social_accounts_provider",
+        ),
+        Index("ix_agency_social_accounts_agency_id", "agency_id"),
+    )
+
+    connection_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agency_social_connections.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    agency_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    platform: Mapped[str] = mapped_column(String(20), nullable=False)
+    provider_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    name: Mapped[Optional[str]] = mapped_column(String(255))
+    username: Mapped[Optional[str]] = mapped_column(String(255))
+    access_token: Mapped[Optional[str]] = mapped_column(Text)
+    is_primary: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
+    authorized: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="true"
+    )
+    connected_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    connection: Mapped["AgencySocialConnection"] = relationship(
+        "AgencySocialConnection", back_populates="accounts"
+    )
 ```
 
-- [ ] **Step 3: Verify the model imports and the table is registered**
+- [ ] **Step 3: Register both models so `Base.metadata` includes the tables**
 
-Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/python -c "from src.models import Base; print('agency_social_connections' in Base.metadata.tables)"`
+In `src/models/__init__.py`, add (alphabetical, before the connection import) and to `__all__`:
+
+```python
+from src.models.agency_social_account import AgencySocialAccount
+from src.models.agency_social_connection import AgencySocialConnection
+```
+
+- [ ] **Step 4: Verify the models import, register, and map cleanly**
+
+Run (Docker backend; mappers must resolve the relationship):
+`docker compose -f docker-compose.local.yml run --rm --no-deps backend python -c "from sqlalchemy.orm import configure_mappers; from src.models import Base, AgencySocialAccount, AgencySocialConnection; configure_mappers(); print({'agency_social_connections','agency_social_accounts'} <= set(Base.metadata.tables))"`
 Expected: `True`
 
-- [ ] **Step 4: Commit**
-
-```bash
-git add src/models/agency_social_connection.py src/models/__init__.py
-git commit -m "feat(meta): add AgencySocialConnection model"
-```
+- [ ] **Step 5: Commit** _(SKIP per execution override — leave in working tree)_
 
 ---
 
@@ -157,15 +234,23 @@ git commit -m "feat(meta): add AgencySocialConnection model"
 **Files:**
 - Create: `alembic/versions/m1a2b3c4d5e6_add_agency_social_connections.py`
 
-- [ ] **Step 1: Write the migration**
+> **Local-environment realities (discovered during execution — read before running anything):**
+>
+> 1. **The venv is `.venv/`, and the `alembic` console script has a stale shebang** (points at the old `/Volumes/T7/...` path). Do **not** run `venv/bin/alembic` or `.venv/bin/alembic`. Run alembic **inside the Docker backend container** instead — that's the canonical local path and where `.env.local` (creds `slicify`/`slicify`, `DB_HOST=postgres`) is mounted as `/app/.env`: `docker compose -f docker-compose.local.yml run --rm --no-deps backend alembic <cmd>`
+> 2. **The local dev DB is from `docker-compose.local.yml`** — Postgres 16, db `sideline_realestate`, user/pass `slicify`/`slicify` on `localhost:5432`. The repo's `.env` (user `ab5`, empty password) is **not** the local config; `.env.local` is. For host-side `psql`: `PGPASSWORD=slicify psql -h localhost -U slicify -d sideline_realestate`.
+> 3. **There were two alembic heads** (`j1e2f3g4h5i6` add_sms_templates [a merge], `k1l2m3n4o5p6` add_swot) both descending from `j1b2c3d4e5f6`. This migration **merges them** via a tuple `down_revision` — that's why it isn't chained off a single revision.
+> 4. **The local DB's migration chain is inconsistent** (`alembic current` = `ffa04a9385ae`, but the schema already contains tables from much later/parallel migrations like `support_tickets` while missing earlier ones like `appraisal_charities`). `alembic upgrade head` will therefore **fail** locally (it re-creates already-present tables). This is a pre-existing local-env condition, not caused by this feature. For **local dev** we create just this one table directly from the model metadata (Step 3). The migration file is still authoritative for **clean tenant/template DBs** at deploy time.
+> 5. **As-built after the `origin/dev` sync (120-commit merge):** the two original parents `j1e2f3g4h5i6`/`k1l2m3n4o5p6` are both already ancestors of dev's head `e3w4x5y6z7a8` (dev merged them at `b6782e0f6c55`), so the committed `down_revision` was **rebased onto `e3w4x5y6z7a8`** (a single value, not the tuple shown in the Step 1 block) per the CLAUDE.md multi-head rule. That collapses alembic back to one head (`m1a2b3c4d5e6` → descends from `e3w4x5y6z7a8`). The Step 1 code block keeps the original tuple for historical context; the on-disk file now reads `down_revision = "e3w4x5y6z7a8"`.
 
-Create `alembic/versions/m1a2b3c4d5e6_add_agency_social_connections.py`:
+- [ ] **Step 1: Write the migration (two tables, up + down)**
+
+Create `alembic/versions/m1a2b3c4d5e6_add_agency_social_connections.py`. Columns/nullability/`server_default`s must match the two models in Task 2. `upgrade()` creates `agency_social_connections` first, then `agency_social_accounts` (FK → connection, `ON DELETE CASCADE`); `downgrade()` drops accounts then connections.
 
 ```python
-"""Add agency_social_connections (Meta OAuth tokens)
+"""Add agency_social_connections + agency_social_accounts (Meta OAuth)
 
 Revision ID: m1a2b3c4d5e6
-Revises: z0t1u2v3w4x5
+Revises: j1e2f3g4h5i6, k1l2m3n4o5p6
 Create Date: 2026-06-04
 """
 
@@ -175,9 +260,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-
 revision: str = "m1a2b3c4d5e6"
-down_revision: Union[str, None] = "z0t1u2v3w4x5"
+down_revision: Union[str, Sequence[str], None] = ("j1e2f3g4h5i6", "k1l2m3n4o5p6")
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -186,31 +270,20 @@ def upgrade() -> None:
     op.create_table(
         "agency_social_connections",
         sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("agency_id", sa.String(length=100), nullable=True),
-        sa.Column("platform", sa.String(length=20), nullable=False),
-        sa.Column("page_id", sa.String(length=100), nullable=True),
-        sa.Column("ig_account_id", sa.String(length=100), nullable=True),
-        sa.Column("page_name", sa.String(length=255), nullable=True),
-        sa.Column("ig_username", sa.String(length=255), nullable=True),
-        sa.Column("access_token", sa.Text(), nullable=True),
-        sa.Column(
-            "is_primary", sa.Boolean(), nullable=False, server_default="false"
-        ),
+        sa.Column("agency_id", sa.String(length=100), nullable=False),
         sa.Column("user_access_token", sa.Text(), nullable=True),
         sa.Column("token_expires_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column(
-            "warning_level", sa.SmallInteger(), nullable=False, server_default="0"
-        ),
-        sa.Column(
             "status", sa.String(length=20), nullable=False, server_default="connected"
         ),
-        sa.Column("last_error", sa.Text(), nullable=True),
         sa.Column(
-            "connected_by_user_id", postgresql.UUID(as_uuid=True), nullable=True
+            "warning_level", sa.SmallInteger(), nullable=False, server_default="0"
         ),
-        sa.Column("last_warned_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("last_error", sa.Text(), nullable=True),
+        sa.Column("connected_by_user_id", postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column("connected_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("last_refreshed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("last_warned_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
@@ -225,24 +298,75 @@ def upgrade() -> None:
         ),
         sa.ForeignKeyConstraint(["connected_by_user_id"], ["users.id"]),
         sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("agency_id", name="uq_agency_social_connections_agency"),
     )
     op.create_index(
         "ix_agency_social_connections_agency_id",
         "agency_social_connections",
         ["agency_id"],
     )
+    op.create_table(
+        "agency_social_accounts",
+        sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("connection_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("agency_id", sa.String(length=100), nullable=False),
+        sa.Column("platform", sa.String(length=20), nullable=False),
+        sa.Column("provider_id", sa.String(length=100), nullable=False),
+        sa.Column("name", sa.String(length=255), nullable=True),
+        sa.Column("username", sa.String(length=255), nullable=True),
+        sa.Column("access_token", sa.Text(), nullable=True),
+        sa.Column(
+            "is_primary", sa.Boolean(), nullable=False, server_default="false"
+        ),
+        sa.Column(
+            "authorized", sa.Boolean(), nullable=False, server_default="true"
+        ),
+        sa.Column("connected_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.ForeignKeyConstraint(
+            ["connection_id"],
+            ["agency_social_connections.id"],
+            ondelete="CASCADE",
+        ),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint(
+            "connection_id",
+            "platform",
+            "provider_id",
+            name="uq_agency_social_accounts_provider",
+        ),
+    )
     op.create_index(
-        "ix_agency_social_connections_agency_primary",
-        "agency_social_connections",
-        ["agency_id", "is_primary"],
+        "ix_agency_social_accounts_connection_id",
+        "agency_social_accounts",
+        ["connection_id"],
+    )
+    op.create_index(
+        "ix_agency_social_accounts_agency_id",
+        "agency_social_accounts",
+        ["agency_id"],
     )
 
 
 def downgrade() -> None:
     op.drop_index(
-        "ix_agency_social_connections_agency_primary",
-        table_name="agency_social_connections",
+        "ix_agency_social_accounts_agency_id", table_name="agency_social_accounts"
     )
+    op.drop_index(
+        "ix_agency_social_accounts_connection_id", table_name="agency_social_accounts"
+    )
+    op.drop_table("agency_social_accounts")
     op.drop_index(
         "ix_agency_social_connections_agency_id",
         table_name="agency_social_connections",
@@ -250,29 +374,44 @@ def downgrade() -> None:
     op.drop_table("agency_social_connections")
 ```
 
-- [ ] **Step 2: Confirm single head before upgrading**
+- [ ] **Step 2: Confirm the migration collapses the two heads into one**
 
-Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/alembic heads`
-Expected: a single head line ending in `m1a2b3c4d5e6 (head)`. If two heads appear, fix `down_revision` to the real current head and re-run.
+Run: `docker compose -f docker-compose.local.yml run --rm --no-deps backend alembic heads`
+Expected: a single head — `m1a2b3c4d5e6 (head)`.
 
-- [ ] **Step 3: Apply to the dev DB**
+- [ ] **Step 3: Apply to the local dev DB (drop the old flat table, create the two new ones)**
 
-Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/alembic upgrade head`
-Expected: `Running upgrade z0t1u2v3w4x5 -> m1a2b3c4d5e6`
-
-- [ ] **Step 4: Verify the table exists**
-
-Run: `psql -d sideline_realestate -c "\d agency_social_connections"`
-Expected: table description listing all columns above.
-
-- [ ] **Step 5: Commit**
+The local alembic chain is inconsistent (realities #4 above), so don't `alembic upgrade head`. Drop the prior single table and create the two new tables from model metadata (dependency order: connection then account):
 
 ```bash
-git add alembic/versions/m1a2b3c4d5e6_add_agency_social_connections.py
-git commit -m "feat(meta): migration for agency_social_connections"
+docker compose -f docker-compose.local.yml run --rm --no-deps backend python -c "
+from sqlalchemy import create_engine, text
+from src.config import settings
+from src.models.agency_social_connection import AgencySocialConnection
+from src.models.agency_social_account import AgencySocialAccount
+url = f'postgresql://{settings.DB_USER}:{settings.DB_PASSWORD}@{settings.DB_HOST}:{settings.DB_PORT}/{settings.DB_DATABASE}'
+e = create_engine(url)
+with e.begin() as c:
+    c.execute(text('DROP TABLE IF EXISTS agency_social_accounts CASCADE'))
+    c.execute(text('DROP TABLE IF EXISTS agency_social_connections CASCADE'))
+AgencySocialConnection.__table__.create(bind=e, checkfirst=True)
+AgencySocialAccount.__table__.create(bind=e, checkfirst=True)
+print('ok')
+"
 ```
 
-> **Note for execution:** Apply to all tenant DBs + `slate_template` with `scripts/migrate_all_tenants.py` only at deploy time (per `CLAUDE.md`) — NOT during local development.
+Expected: `ok`. (Drops the old flat table — any existing dev connection is cleared; reconnect afterwards.)
+
+- [ ] **Step 4: Verify the migration up/down/up + both tables**
+
+The migration's `upgrade()`/`downgrade()` were verified against the local DB by binding the alembic `op` proxy and running upgrade → downgrade → upgrade; both tables create and drop cleanly and the columns match the models. To spot-check the live tables:
+
+`PGPASSWORD=slicify psql -h localhost -U slicify -d sideline_realestate -c "\d agency_social_connections" -c "\d agency_social_accounts"`
+Expected: connections has `UNIQUE(agency_id)` + FK→`users`; accounts has `UNIQUE(connection_id, platform, provider_id)` + FK→`agency_social_connections` `ON DELETE CASCADE` + index on `agency_id`/`connection_id`.
+
+- [ ] **Step 5: (No commit)** — leave the migration in the working tree for review.
+
+> **Deploy execution (not local):** on clean tenant DBs + `slate_template`, the migration applies normally via `scripts/migrate_all_tenants.py` — it merges the two heads and creates both tables in one pass. The direct metadata-create above is **local-dev only**.
 
 ---
 
@@ -281,12 +420,16 @@ git commit -m "feat(meta): migration for agency_social_connections"
 **Files:**
 - Create: `src/integrations/meta_graph.py`
 
+> **As-built (expires_in robustness):** Facebook's long-lived token exchange does **not** always include `expires_in` (it's omitted/`0` when re-authorizing an already-authorized app, or for effectively non-expiring tokens). Reading it as a hard `data["expires_in"]` raised `KeyError` → 500 on the callback during **reconnect**. `exchange_for_long_lived` defaults a missing/zero value to `LONG_LIVED_TTL_SECONDS` (60 days, Facebook's standard long-lived user-token lifetime). `refresh_long_lived` reuses the same path, so the monitor inherits the safety too.
+
 - [ ] **Step 1: Write the client**
 
 Create `src/integrations/meta_graph.py`:
 
+Return types are precise `TypedDict`s derived from the Meta Graph API docs (token endpoints return `access_token`/`expires_in`/`token_type`; `/me/accounts` returns page objects with `id`/`name`/`access_token`; the `instagram_business_account` subfield returns `id`/`username`). `_get` stays the untyped JSON boundary (`dict[str, Any]`) so the public methods narrow without any `cast()` — `.get(...)` yields `Any`, which is assignable to the declared `TypedDict` returns:
+
 ```python
-from typing import Any, Optional
+from typing import Any, NotRequired, Optional, TypedDict
 
 import httpx
 import structlog
@@ -294,6 +437,25 @@ import structlog
 from src.config import settings
 
 logger = structlog.get_logger()
+
+LONG_LIVED_TTL_SECONDS = 60 * 24 * 60 * 60
+
+
+class MetaTokenResponse(TypedDict):
+    access_token: str
+    expires_in: int
+    token_type: NotRequired[str]
+
+
+class MetaPage(TypedDict):
+    id: str
+    name: str
+    access_token: str
+
+
+class MetaIgAccount(TypedDict):
+    id: str
+    username: NotRequired[str]
 
 
 class MetaGraphError(Exception):
@@ -328,8 +490,8 @@ class MetaGraphClient:
         )
         return data["access_token"]
 
-    async def exchange_for_long_lived(self, short_token: str) -> dict[str, Any]:
-        return await self._get(
+    async def exchange_for_long_lived(self, short_token: str) -> MetaTokenResponse:
+        data = await self._get(
             "/oauth/access_token",
             {
                 "grant_type": "fb_exchange_token",
@@ -338,11 +500,18 @@ class MetaGraphClient:
                 "fb_exchange_token": short_token,
             },
         )
+        result: MetaTokenResponse = {
+            "access_token": data["access_token"],
+            "expires_in": int(data.get("expires_in") or LONG_LIVED_TTL_SECONDS),
+        }
+        if "token_type" in data:
+            result["token_type"] = data["token_type"]
+        return result
 
-    async def refresh_long_lived(self, long_token: str) -> dict[str, Any]:
+    async def refresh_long_lived(self, long_token: str) -> MetaTokenResponse:
         return await self.exchange_for_long_lived(long_token)
 
-    async def get_pages(self, user_token: str) -> list[dict[str, Any]]:
+    async def get_pages(self, user_token: str) -> list[MetaPage]:
         data = await self._get(
             "/me/accounts",
             {"access_token": user_token, "fields": "id,name,access_token"},
@@ -351,7 +520,7 @@ class MetaGraphClient:
 
     async def get_ig_account(
         self, page_id: str, page_token: str
-    ) -> Optional[dict[str, Any]]:
+    ) -> Optional[MetaIgAccount]:
         data = await self._get(
             f"/{page_id}",
             {
@@ -362,21 +531,18 @@ class MetaGraphClient:
         return data.get("instagram_business_account")
 ```
 
+> **Task 5 compatibility:** the `TypedDict`s are plain dicts at runtime, so downstream subscripting (`long["access_token"]`, `long["expires_in"]`, `page["id"]`, `ig["id"]`) is unchanged. `token_type` and `ig["username"]` are `NotRequired` — read them with `.get(...)`.
+
 - [ ] **Step 2: Verify it imports**
 
-Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/python -c "from src.integrations.meta_graph import MetaGraphClient, MetaGraphError; print(MetaGraphClient().base_url)"`
-Expected: `https://graph.facebook.com/v21.0`
+Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && .venv/bin/python -c "from src.integrations.meta_graph import MetaGraphClient, MetaGraphError, MetaTokenResponse, MetaPage, MetaIgAccount; print(MetaGraphClient().base_url)"`
+Expected: `https://graph.facebook.com/v21.0` (note: the venv is `.venv/`, not `venv/`).
 
-- [ ] **Step 3: Commit**
-
-```bash
-git add src/integrations/meta_graph.py
-git commit -m "feat(meta): add MetaGraphClient (Graph API SDK-lite)"
-```
+- [ ] **Step 3: (No commit)** — leave the file in the working tree for review per the execution override.
 
 ---
 
-### Task 5: Backend API — connect / callback / connections / disconnect
+### Task 5: Backend API — connect / callback / connection / disconnect
 
 **Files:**
 - Create: `src/api/meta_social.py`
@@ -384,7 +550,16 @@ git commit -m "feat(meta): add MetaGraphClient (Graph API SDK-lite)"
 
 - [ ] **Step 1: Write the API module**
 
-Create `src/api/meta_social.py`:
+> **As-built note (authoritative) — implemented against the two-table model (Task 2) and split across strict layers (per `src/CLAUDE.md`). The long Python block further down is the ORIGINAL flat-table sketch, kept only for narrative; it is SUPERSEDED. Source of truth is the actual files described here:**
+>
+> - **Router** `src/api/meta_social.py` — thin endpoints only: DI + call service + return schema. Keeps `_resolve_slug` (request concern) and `_close_window_html` (OAuth-popup presentation, returns `HTMLResponse`). `connect` needs no DB. Authenticated endpoints (`connect/instagram`, `connection` GET/DELETE) use `Depends(get_tenant_scoped_db)`; the unauthenticated `callback` resolves the tenant from the signed `state`, opens `get_tenant_session_factory(slug)`, calls `service.connect_pages`, commits. The "connect Facebook first" check is a `409` raised in the router off `service.has_facebook()`. `GET /connection` returns `MetaConnectionResponse | None`; `DELETE /connection` → 204.
+> - **Service** `src/services/meta_social_service.py` — module-level OAuth mechanics (`make_state`/`parse_state`/`facebook_authorize_url`/`instagram_authorize_url`/`redirect_uri`/`_expiry_from`, plus `FACEBOOK_SCOPES`/`INSTAGRAM_SCOPES`/`STATE_TTL_SECONDS`/`WARNING_LEVEL_NONE`) **stateless, no session**; `parse_state` raises `ValueError` (never `HTTPException`). Class `MetaSocialService(session, graph_client=None)` **injects** `MetaGraphClient` with a default fallback (`self.graph = graph_client or MetaGraphClient()`, matching `daily_briefing`/`reengagement_engine`/`phone_call_processor`) so tests can pass a fake. Methods: `has_facebook` (connection exists AND has a facebook account), `get_connection`, `disconnect`, `connect_pages` (exchange → `_store`). `_store` deletes the agency's connection (the DB FK `ON DELETE CASCADE` clears its accounts), builds **one** `AgencySocialConnection` (user token + lifecycle) and appends `AgencySocialAccount` children via `_attach_accounts` (one facebook account per page + an instagram account when the page has a linked IG business account); `is_primary` = first page. Row builders: `_connection_row`/`_facebook_account`/`_instagram_account` (page token obfuscated onto each account; IG reuses the page token). `MetaGraphError` propagates to the router error popup.
+> - **Repository** `src/db/repositories/agency_social_connection.py` — `AgencySocialConnectionRepository(BaseRepository)`: `get_by_agency` (returns the single connection; its `accounts` are eager-loaded via the relationship's `lazy="selectin"`) and `delete_by_agency`. Accounts need **no** separate repo — reads come through the relationship, writes through the cascade.
+> - **Schema** `src/schemas/meta_social.py` — `AuthorizeUrlResponse`; `MetaAccountResponse` (per Page/IG asset: `platform`/`provider_id`/`name`/`username`/`is_primary`/`authorized`); `MetaConnectionResponse` (one per agency: `status`/`token_expires_at`/`warning_level`/`connected_at` + nested `accounts: list[MetaAccountResponse]`). Both ORM schemas use `model_config = {"from_attributes": True}`; the GET endpoint returns `MetaConnectionResponse.model_validate(row)` or `None`.
+> - **Constants** — `MetaPlatform` and `MetaConnectionStatus` str-enums in `src/constants.py` (shared by service; assigned via `.value` to the String columns).
+> - **Obfuscation** — shared `src/utils.py` `obfuscate`/`deobfuscate` (base64 for now; swap to real encryption there later), imported by the service.
+
+Create `src/api/meta_social.py` (⚠️ flat-table sketch — superseded by the two-table as-built note above):
 
 ```python
 import base64
@@ -417,7 +592,6 @@ STATE_TTL_SECONDS = 600
 FACEBOOK_SCOPES = [
     "pages_show_list",
     "pages_read_engagement",
-    "pages_manage_metadata",
     "business_management",
 ]
 INSTAGRAM_SCOPES = ["instagram_basic"]
@@ -685,39 +859,200 @@ In `create_app()`, after the `application.include_router(trademe_oauth_router)` 
 - [ ] **Step 3: Verify the app boots and routes are registered**
 
 Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/python -c "from src.main import app; print([r.path for r in app.routes if '/meta' in getattr(r, 'path', '')])"`
-Expected: includes `/api/auth/meta/connect`, `/api/auth/meta/connect/instagram`, `/api/auth/meta/callback`, `/api/social/meta/connections`.
+Expected: includes `/api/auth/meta/connect`, `/api/auth/meta/connect/instagram`, `/api/auth/meta/callback`, `/api/social/meta/connection`.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: Commit** — SKIP (execution override: leave changes in the working tree).
+
+---
+
+### Task 5b: Encrypt tokens at rest with Fernet (security hardening)
+
+**Why:** Tokens are currently **base64-obfuscated, not encrypted** — `src/utils.py`'s
+`obfuscate`/`deobfuscate` are plain `base64.b64encode/decode` (no key). Anyone with tenant-DB
+read access, a backup, or a logged query can recover live Page/User tokens in one line.
+Replace the obfuscation with real authenticated encryption (Fernet = AES-128-CBC + HMAC).
+`cryptography==46.0.5` is **already** in `requirements.txt` — no new dependency.
+
+**Scope:** `src/utils.py`'s `obfuscate`/`deobfuscate` are used **only** by the Meta feature
+(`meta_social_service.py`, and the monitor/tests in Tasks 10/13). Every other credential
+store (WhatsApp, Telegram, SMS, platform creds, LLM) has its **own** private base64
+`_obfuscate`/`_deobfuscate` and is **out of scope** here — they share the same weakness and
+can adopt this helper later, but that's a separate change.
+
+**Files:**
+
+- Modify: `src/config.py`
+- Modify: `src/utils.py`
+- Modify: `src/services/meta_social_service.py`
+- Create: `scripts/generate_token_encryption_key.py`
+- Modify (deploy rollout): `.env.template`, `.env.example`, slicify-control `src/config.py` + `src/services/provisioner.py` + `.env.example`
+- Dev only: `.env.local`
+
+- [ ] **Step 1: Add the key to config**
+
+In `src/config.py`, add alongside the other Meta/secret settings:
+
+```python
+    TOKEN_ENCRYPTION_KEY: str = ""
+```
+
+Empty default keeps non-Meta code unaffected; encrypt/decrypt fail loudly if it's unset when
+the Meta feature is actually used (Step 2).
+
+- [ ] **Step 2: Replace obfuscation with Fernet in `src/utils.py`**
+
+Replace the two base64 functions:
+
+```python
+def obfuscate(value: str) -> str:
+    return base64.b64encode(value.encode()).decode()
+
+
+def deobfuscate(encoded: str) -> str:
+    return base64.b64decode(encoded.encode()).decode()
+```
+
+with key-backed encrypt/decrypt (rename to honest names):
+
+```python
+from cryptography.fernet import Fernet
+
+from src.config import settings
+
+
+def _fernet() -> Fernet:
+    if not settings.TOKEN_ENCRYPTION_KEY:
+        raise RuntimeError("TOKEN_ENCRYPTION_KEY is not configured")
+    return Fernet(settings.TOKEN_ENCRYPTION_KEY.encode())
+
+
+def encrypt(value: str) -> str:
+    return _fernet().encrypt(value.encode()).decode()
+
+
+def decrypt(token: str) -> str:
+    return _fernet().decrypt(token.encode()).decode()
+```
+
+Put the `Fernet`/`settings` imports at the top with the other imports (order: stdlib →
+third-party → local). `src/config.py` does **not** import `src/utils.py`, so there's no
+circular import. Remove `import base64` if it's now unused in the file (it is, unless other
+code references it — verify with a grep).
+
+- [ ] **Step 3: Update the Meta call sites**
+
+In `src/services/meta_social_service.py`, change `from src.utils import obfuscate` to
+`from src.utils import encrypt`, and replace the three `obfuscate(...)` calls
+(`user_access_token=`, the two account `access_token=`) with `encrypt(...)`.
+
+> The monitor (Task 10) and its tests (Task 13) — re-synced to the two-table model — import
+> `decrypt`/`encrypt` from `src.utils` (not `deobfuscate`/`obfuscate`). Use the new names
+> when those tasks are written.
+
+- [ ] **Step 4: Dev key + clear stale base64 rows**
+
+Generate a dev key straight into `.env.local` (the file the local Docker backend mounts as
+`/app/.env`) with the helper script — `--write` fills/appends the line, `--force` rotates:
 
 ```bash
-git add src/api/meta_social.py src/main.py
-git commit -m "feat(meta): connect/callback/connections endpoints"
+docker compose -f docker-compose.local.yml run --rm --no-deps backend \
+  python scripts/generate_token_encryption_key.py --write .env.local
 ```
+
+(Bare `python scripts/generate_token_encryption_key.py` just prints a key; `--env-line`
+prints a paste-ready `TOKEN_ENCRYPTION_KEY=<key>` line.) Existing dev rows hold **base64**,
+which Fernet can't decrypt — clear them (tokens are re-derivable by reconnecting):
+
+```bash
+docker compose -f docker-compose.local.yml exec -T postgres \
+  psql -U slicify -d sideline_realestate -c "DELETE FROM agency_social_connections;"
+```
+
+Restart the backend, then reconnect via the Meta tab so tokens are re-stored **encrypted**.
+
+- [ ] **Step 5: Verify**
+
+Round-trip + prove the stored value is no longer plain base64:
+
+```bash
+docker compose -f docker-compose.local.yml run --rm --no-deps backend python -c "
+import base64
+from src.utils import encrypt, decrypt
+c1, c2 = encrypt('EAAsecret'), encrypt('EAAsecret')
+assert decrypt(c1) == 'EAAsecret'
+assert c1 != c2  # Fernet uses a random IV per call
+try:
+    print('base64-decodes to token?', base64.b64decode(c1).decode(errors='ignore').startswith('EAA'))
+except Exception as e:
+    print('not plain base64 ->', type(e).__name__)
+print('ok')
+"
+```
+
+Expected: `ok`, and the value does **not** base64-decode to an `EAA…` token. After Step 4's
+reconnect, re-run the DB probe from earlier — the stored column should no longer decode to a
+live token.
+
+- [ ] **Step 6: Deploy rollout (shared env key — NOT run during local dev)**
+
+Mirror the shared-key flow in `CLAUDE.md` ("Rolling out a new shared env var to every tenant"):
+
+1. `.env.template` — add `TOKEN_ENCRYPTION_KEY={{TOKEN_ENCRYPTION_KEY}}`.
+2. `.env.example` — add a documented `TOKEN_ENCRYPTION_KEY=` line.
+3. slicify-control — add `slate_token_encryption_key` to `src/config.py`, a substitution in
+   `src/services/provisioner.py`'s `replacements`, and a line in its `.env.example`.
+4. Patch existing tenants (one shared key across tenants; dry-run first):
+
+   ```bash
+   venv/bin/python scripts/patch_tenant_envs.py --set TOKEN_ENCRYPTION_KEY=<key> \
+       --section "Meta token encryption" --dry-run
+   ```
+
+5. Restart slate.
+
+> **Ordering caveat:** this must ship **before** any tenant connects Meta in production —
+> once live, switching the cipher would orphan already-stored tokens (Fernet can't read old
+> base64). No prod tokens exist yet, so there's nothing to migrate; UAT/dev just
+> disconnect+reconnect. A single app-wide key is used (simplest, matches the other shared
+> secrets); per-tenant keys are a possible later hardening. Losing the key means every stored
+> token must be re-fetched via reconnect — it is **not** otherwise recoverable.
+
+- [ ] **Step 7: Commit** — SKIP (execution override: leave changes in the working tree).
 
 ---
 
 ### Task 6: Frontend types + API client
 
 **Files:**
-- Modify: `frontend/src/types/index.ts`
+- Create: `frontend/src/types/meta.ts`
 - Create: `frontend/src/api/metaCredentials.ts`
+
+> **As-built:** the codebase keeps one type file per domain (`src/types/whatsapp.ts`, `platform.ts`, …) imported directly, rather than one growing `index.ts`. So these interfaces live in a dedicated **`frontend/src/types/meta.ts`** and are imported as `from "../types/meta"` (not `from "../types"`). `MetaSettingsPage.tsx` (Task 7) imports `MetaConnectResponse` from `../types/meta` as well.
 
 - [ ] **Step 1: Add types**
 
-Append to `frontend/src/types/index.ts`:
+Create `frontend/src/types/meta.ts` (two-table shape — one connection per agency, nesting its accounts):
 
 ```ts
+export type MetaPlatform = "facebook" | "instagram";
+
+export interface MetaAccount {
+  id: string;
+  platform: MetaPlatform;
+  provider_id: string;
+  name: string | null;
+  username: string | null;
+  is_primary: boolean;
+  authorized: boolean;
+}
+
 export interface MetaConnection {
   id: string;
-  platform: "facebook" | "instagram";
-  page_id: string | null;
-  ig_account_id: string | null;
-  page_name: string | null;
-  ig_username: string | null;
-  is_primary: boolean;
   status: string;
   token_expires_at: string | null;
   warning_level: number;
+  connected_at: string | null;
+  accounts: MetaAccount[];
 }
 
 export interface MetaConnectResponse {
@@ -727,14 +1062,14 @@ export interface MetaConnectResponse {
 
 - [ ] **Step 2: Add API calls**
 
-Create `frontend/src/api/metaCredentials.ts`:
+Create `frontend/src/api/metaCredentials.ts` (the GET returns the single connection, or `null` when none):
 
 ```ts
 import { del, get } from "./client";
-import type { MetaConnection, MetaConnectResponse } from "../types";
+import type { MetaConnection, MetaConnectResponse } from "../types/meta";
 
-export const fetchMetaConnections = () =>
-  get<MetaConnection[]>("/social/meta/connections");
+export const fetchMetaConnection = () =>
+  get<MetaConnection | null>("/social/meta/connection");
 
 export const metaConnectFacebook = () =>
   get<MetaConnectResponse>("/auth/meta/connect");
@@ -742,7 +1077,7 @@ export const metaConnectFacebook = () =>
 export const metaConnectInstagram = () =>
   get<MetaConnectResponse>("/auth/meta/connect/instagram");
 
-export const metaDisconnect = () => del("/social/meta/connections");
+export const metaDisconnect = () => del("/social/meta/connection");
 ```
 
 - [ ] **Step 3: Verify the frontend type-checks**
@@ -750,12 +1085,7 @@ export const metaDisconnect = () => del("/social/meta/connections");
 Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate/frontend" && npx tsc --noEmit`
 Expected: no errors referencing `metaCredentials.ts` or `MetaConnection`.
 
-- [ ] **Step 4: Commit**
-
-```bash
-git add frontend/src/types/index.ts frontend/src/api/metaCredentials.ts
-git commit -m "feat(meta): frontend types + api client"
-```
+- [ ] **Step 4: Commit** _(SKIP per execution override — leave in working tree)_
 
 ---
 
@@ -824,6 +1154,8 @@ export function MetaAccountCard(props: MetaAccountCardProps) {
   );
 }
 ```
+
+> **As-built (connected-state button):** `MetaAccountCard` derives its button from the `connected` prop — when connected it renders a secondary-styled **"Reconnect"** button (re-runs the same idempotent connect flow); when not connected it renders the primary `buttonLabel`. Label/style constants (`RECONNECT_LABEL`, `BUTTON_BASE`/`BUTTON_PRIMARY`/`BUTTON_SECONDARY`) live at the top of the card file.
 
 - [ ] **Step 2: Panel that fetches + orchestrates**
 
@@ -922,6 +1254,31 @@ export function MetaSettingsPanel() {
 }
 ```
 
+> **As-built (two-table data shape):** the panel calls `fetchMetaConnection()` (singular → `MetaConnection | null`, query key `["meta-connection"]`) instead of a list. Connection state is derived from the nested accounts: `const accounts = connection?.accounts ?? []; facebookConnected = accounts.some(a => a.platform === PLATFORM_FACEBOOK); instagramConnected = accounts.some(a => a.platform === PLATFORM_INSTAGRAM)` (platform literals are file-scoped constants). The OAuth-complete message handler invalidates `["meta-connection"]`.
+>
+> **As-built fix (popup blocker):** opening `window.open(authorize_url, …)` inside the mutation's `onSuccess` is blocked by browsers because it runs *after* the awaited request, outside the click's user-gesture. The shipped `MetaSettingsPage.tsx` instead opens a blank popup **synchronously** in the click handler, then sets `popup.location.href` once the URL returns (and `popup.close()` on error):
+>
+> ```tsx
+> const POPUP_NAME = "meta-oauth";
+> function openBlankPopup() {
+>   return window.open("", POPUP_NAME, POPUP_FEATURES);
+> }
+> function navigatePopup(popup: Window | null, data: MetaConnectResponse) {
+>   if (!popup) {
+>     return;
+>   }
+>   popup.location.href = data.authorize_url;
+> }
+> // mutations are plain useMutation({ mutationFn }); handlers do:
+> function handleConnectFacebook() {
+>   const popup = openBlankPopup();
+>   facebookMutation.mutate(undefined, {
+>     onSuccess: (data) => navigatePopup(popup, data),
+>     onError: () => popup?.close(),
+>   });
+> }
+> ```
+
 - [ ] **Step 3: Add the Meta tab to the Integrations page**
 
 In `frontend/src/pages/IntegrationsPage.tsx`, add to the `FIXED_TABS` array:
@@ -947,23 +1304,39 @@ Add the dispatch line alongside the other `isFixedTab && activeTab === ...` line
 Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate/frontend" && npx tsc --noEmit && npm run build`
 Expected: no type errors; build succeeds.
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add frontend/src/components/integrations/MetaAccountCard.tsx frontend/src/pages/MetaSettingsPage.tsx frontend/src/pages/IntegrationsPage.tsx
-git commit -m "feat(meta): Integrations Meta tab (Facebook + Instagram cards)"
-```
+- [ ] **Step 5: Commit** _(SKIP per execution override — leave in working tree)_
 
 ---
 
 ### Task 8: Manual end-to-end verification (Milestone 1)
 
-**Pre-req:** A real Meta app exists; set `FACEBOOK_APP_ID`, `FACEBOOK_APP_SECRET`, `PUBLIC_BASE_URL` in `.env`. In the Meta app dashboard, add `{PUBLIC_BASE_URL}/api/auth/meta/callback` to Valid OAuth Redirect URIs.
+**Pre-req — environment config.** The local backend runs in **Docker** (`docker-compose.local.yml`), and that container mounts **`.env.local`** as `/app/.env` — **not** the repo's `.env`. So the Meta keys must be in `.env.local` (the `scripts/patch_tenant_envs.py` / `.env.template` path is for tenant `.env_<slug>` files, separate concern). Set in `.env.local`:
+
+```
+FACEBOOK_APP_ID=...
+FACEBOOK_APP_SECRET=...
+PUBLIC_BASE_URL=https://local.slatedev.com
+# META_GRAPH_VERSION defaults to v21.0 in src/config.py — only set to override
+```
+
+After editing `.env.local`, restart the backend so config reloads:
+`docker compose -f docker-compose.local.yml restart backend`.
+
+**Pre-req — Meta app dashboard.** A real Meta app must exist, and **three different fields** must be configured (each rejects a different format — domain vs full URL):
+
+| Dashboard field | Location | Value |
+| --- | --- | --- |
+| **App Domains** | Settings → Basic | `local.slatedev.com` (bare domain) |
+| **Valid OAuth Redirect URIs** | Facebook Login → Settings | `https://local.slatedev.com/api/auth/meta/callback` (full URL) |
+| **Allowed Domains for redirect** | Facebook Login → Settings | `local.slatedev.com` (bare domain) |
+
+Use the **Redirect URI Validator** on the Facebook Login → Settings page to confirm the full callback URL turns green before testing.
+
+**Pre-req — app mode / scopes.** Requested scopes are `pages_show_list`, `pages_read_engagement`, `business_management` (+ `instagram_basic` for IG). `pages_manage_metadata` was removed — Meta returns `Invalid Scopes` for it on this app type. These are **advanced** permissions: in **Development mode** they're granted only to accounts with an app **role** (Admin/Developer/Tester); production needs **App Review**. `redirect_uri` must be the **absolute** `{PUBLIC_BASE_URL}/...` — an empty `PUBLIC_BASE_URL` yields a relative `/api/...` and a blank Facebook dialog.
 
 - [ ] **Step 1: Run backend + frontend**
 
-Backend: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/uvicorn src.main:app --reload`
-Frontend: `cd frontend && npm run dev`
+Backend already runs as the `slicify-realestate-backend` Docker container (uvicorn `--reload`, source mounted at `/app`) behind Caddy on `https://local.slatedev.com`. Confirm it's up: `docker compose -f docker-compose.local.yml ps`. Start the frontend: `cd frontend && npm run dev`.
 
 - [ ] **Step 2: Connect Facebook**
 
@@ -971,18 +1344,20 @@ Navigate to Integrations → Meta. Click **Connect Facebook**. Complete the Face
 
 - [ ] **Step 3: Verify rows landed**
 
-Run: `psql -d sideline_realestate -c "SELECT platform, page_name, ig_username, is_primary, status, token_expires_at IS NOT NULL AS has_expiry FROM agency_social_connections;"`
+Run (local Postgres runs in Docker): `docker compose -f docker-compose.local.yml exec -T postgres psql -U slicify -d sideline_realestate -c "SELECT platform, page_name, ig_username, is_primary, status, token_expires_at IS NOT NULL AS has_expiry FROM agency_social_connections;"`
 Expected: one `facebook` row per Page (`is_primary=t` on the first), plus an `instagram` row for any Page with a linked IG Business account; `status=connected`, `has_expiry=t`.
 
-- [ ] **Step 4: Verify disconnect**
+> **Verified (2026-06-05):** Facebook path confirmed end-to-end — Page **"Slicify Test"** stored (`is_primary=t`, `status=connected`, expiry set). No IG row because that Page has no linked IG Business account (expected). IG path still needs a Page with a linked IG Business account to exercise fully.
 
-In the UI (or `curl -X DELETE` with auth), trigger disconnect, then re-run the query. Expected: zero rows. Reconnect to confirm idempotency (no duplicate rows).
+- [ ] **Step 4: Verify disconnect / reconnect**
+
+There is no Disconnect button in the UI (chosen behaviour: a **Reconnect** button on the connected card re-runs the idempotent connect flow). To clear rows, call the API directly (`curl -X DELETE` with auth, or `DELETE /api/social/meta/connections`) and re-run the query → zero rows. Then **Reconnect** from the card and confirm no duplicate rows.
 
 ---
 
 ## Milestone 2 — Instagram after Facebook
 
-The backend already auto-derives IG during the Facebook connect (Task 5 `_store_connection`) and exposes `/api/auth/meta/connect/instagram` (gated on an existing Facebook row). The frontend already disables the Instagram card until Facebook is connected (Task 7). This milestone is verification + the explicit IG-scope re-consent path.
+The backend already auto-derives IG during the Facebook connect (Task 5 `MetaSocialService._store` / `_store_page`) and exposes `/api/auth/meta/connect/instagram` (gated on an existing Facebook row). The frontend already disables the Instagram card until Facebook is connected (Task 7). This milestone is verification + the explicit IG-scope re-consent path.
 
 ### Task 9: Manual verification of Instagram gating + connect
 
@@ -997,25 +1372,62 @@ Expected: `409`.
 
 Connect Facebook first, then click **Connect Instagram**. The popup runs the OAuth with IG scopes and returns success. Confirm the `instagram` row(s) exist and the Instagram pill shows **Connected**:
 
-Run: `psql -d sideline_realestate -c "SELECT platform, ig_username, status FROM agency_social_connections WHERE platform='instagram';"`
+Run: `docker compose -f docker-compose.local.yml exec -T postgres psql -U slicify -d sideline_realestate -c "SELECT platform, ig_username, status FROM agency_social_connections WHERE platform='instagram';"`
 Expected: one row per linked IG Business account, `status=connected`.
 
-- [ ] **Step 3: Commit (if any wording/scope tweaks were needed)**
-
-```bash
-git add -A && git commit -m "feat(meta): verify Instagram-after-Facebook gating" --allow-empty
-```
+- [ ] **Step 3: Commit** _(SKIP per execution override — leave in working tree)_
 
 ---
 
 ## Milestone 3 — Daily token monitor + silent refresh + warnings (with tests)
 
+> **Two-table, connection-level (re-synced).** The monitor iterates **one
+> `AgencySocialConnection` per agency** (not per-Page rows) and writes the lifecycle fields
+> (`status`, `warning_level`, `token_expires_at`, `user_access_token`, `last_refreshed_at`,
+> `last_warned_at`, `last_error`) directly onto that single connection row — no more "UPDATE
+> all agency rows". Tests seed a connection + a facebook `AgencySocialAccount` child.
+>
+> **Refresh strategy (resolved — keep silent refresh).** When ≤14 days remain the loop calls
+> `refresh_long_lived` (`fb_exchange_token`) on the user token and, on success, stores the
+> returned token + expiry; a genuine extension past 14 days clears prior warnings. On a hard
+> failure (expired/revoked) it falls through to `needs_reconnect` + a one-time reconnect
+> notification. **Honest caveat:** for server-side apps Meta often returns a token with
+> roughly the _same_ remaining lifetime and `fb_exchange_token` does **not** reset the 60-day
+> clock, and Page tokens don't expire while the user token is valid — so silent refresh is
+> best-effort and the 14/5-day warning + reconnect path is the guaranteed backstop. Page
+> tokens are **not** re-fetched on refresh (they stay valid).
+
 ### Task 10: `meta_token_monitor` service
 
 **Files:**
+- Modify: `src/db/repositories/agency_social_connection.py`
 - Create: `src/services/meta_token_monitor.py`
 
-- [ ] **Step 1: Write the service**
+> **Refactor-aligned:** keeps the functional `process_agency_tokens(session, client, now)` API (client injected as a parameter — same stateless pattern as `runtime_settings.py`, and what the tests already call), but all DB access goes through `AgencySocialConnectionRepository` / `UserRepository` (no inline `select`/`update`/`session.get`), and statuses use the `MetaConnectionStatus` enum.
+
+- [ ] **Step 1: Add the repository methods**
+
+Add to `AgencySocialConnectionRepository` in `src/db/repositories/agency_social_connection.py` (the file from Task 5's refactor):
+
+```python
+    async def list_primary(self) -> list[AgencySocialConnection]:
+        stmt = select(AgencySocialConnection).where(
+            AgencySocialConnection.is_primary.is_(True)
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def update_by_agency(self, agency_id: str, **values) -> None:
+        await self.session.execute(
+            update(AgencySocialConnection)
+            .where(AgencySocialConnection.agency_id == agency_id)
+            .values(**values)
+        )
+```
+
+Add `update` to the existing sqlalchemy import: `from sqlalchemy import delete, select, update`.
+
+- [ ] **Step 2: Write the service**
 
 Create `src/services/meta_token_monitor.py`:
 
@@ -1025,19 +1437,23 @@ from datetime import datetime, timedelta, timezone
 
 import asyncpg
 import structlog
-from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.meta_social import _deobfuscate, _obfuscate
 from src.config import list_available_tenants
+from src.constants import MetaConnectionStatus
+from src.db.repositories.agency_social_connection import (
+    AgencySocialConnectionRepository,
+)
+from src.db.repositories.user import UserRepository
 from src.db.session import async_session_factory, get_tenant_session_factory
 from src.integrations.meta_graph import MetaGraphClient, MetaGraphError
 from src.models.agency_social_connection import AgencySocialConnection
-from src.models.user import User
+from src.utils import deobfuscate, obfuscate
 
 logger = structlog.get_logger()
 
 CHECK_INTERVAL_SECONDS = 24 * 60 * 60
+WARN_NONE = 0
 WARN_14 = 14
 WARN_5 = 5
 RECONNECT_MESSAGE = (
@@ -1047,30 +1463,19 @@ RECONNECT_MESSAGE = (
 )
 
 
-async def _set_agency(
-    session: AsyncSession, agency_id: str, **values
-) -> None:
-    await session.execute(
-        update(AgencySocialConnection)
-        .where(AgencySocialConnection.agency_id == agency_id)
-        .values(**values)
-    )
-
-
 async def notify_reconnect(
     session: AsyncSession, agency_id: str, connected_by_user_id
 ) -> None:
-    from src.db.repositories.user import UserRepository
     from src.internal_agents import get_internal_agent
 
+    users = UserRepository(session)
     emails: list[str] = []
     if connected_by_user_id:
-        initiator = await session.get(User, connected_by_user_id)
+        initiator = await users.get_by_id(connected_by_user_id)
         if initiator and initiator.is_active:
             emails = [initiator.email]
     if not emails:
-        repo = UserRepository(session)
-        emails = [u.email for u in await repo.get_admins()]
+        emails = [u.email for u in await users.get_admins()]
     if not emails:
         logger.warning("meta_monitor.no_recipient", agency_id=agency_id)
         return
@@ -1087,6 +1492,7 @@ async def notify_reconnect(
 
 async def _process_one_agency(
     session: AsyncSession,
+    repo: AgencySocialConnectionRepository,
     client: MetaGraphClient,
     primary: AgencySocialConnection,
     now: datetime,
@@ -1100,22 +1506,20 @@ async def _process_one_agency(
     if days_remaining <= WARN_14:
         try:
             refreshed = await client.refresh_long_lived(
-                _deobfuscate(primary.user_access_token)
+                deobfuscate(primary.user_access_token)
             )
         except MetaGraphError:
-            await _set_agency(
-                session,
+            await repo.update_by_agency(
                 agency_id,
-                status="needs_reconnect",
+                status=MetaConnectionStatus.NEEDS_RECONNECT.value,
                 last_error="silent refresh failed",
             )
             await notify_reconnect(session, agency_id, primary.connected_by_user_id)
             return
-        new_expiry = now + timedelta(seconds=int(refreshed.get("expires_in", 0)))
-        await _set_agency(
-            session,
+        new_expiry = now + timedelta(seconds=int(refreshed["expires_in"]))
+        await repo.update_by_agency(
             agency_id,
-            user_access_token=_obfuscate(refreshed["access_token"]),
+            user_access_token=obfuscate(refreshed["access_token"]),
             token_expires_at=new_expiry,
             last_refreshed_at=now,
         )
@@ -1123,42 +1527,40 @@ async def _process_one_agency(
         days_remaining = (token_expires_at - now).days
 
     if days_remaining <= 0:
-        await _set_agency(session, agency_id, status="expired")
+        await repo.update_by_agency(
+            agency_id, status=MetaConnectionStatus.EXPIRED.value
+        )
         return
     if days_remaining <= WARN_5 and primary.warning_level != WARN_5:
-        await _set_agency(
-            session,
+        await repo.update_by_agency(
             agency_id,
             warning_level=WARN_5,
-            status="expiring",
+            status=MetaConnectionStatus.EXPIRING.value,
             last_warned_at=now,
         )
         return
-    if days_remaining <= WARN_14 and primary.warning_level == 0:
-        await _set_agency(
-            session,
+    if days_remaining <= WARN_14 and primary.warning_level == WARN_NONE:
+        await repo.update_by_agency(
             agency_id,
             warning_level=WARN_14,
-            status="expiring",
+            status=MetaConnectionStatus.EXPIRING.value,
             last_warned_at=now,
         )
         return
     if days_remaining > WARN_14:
-        await _set_agency(
-            session, agency_id, warning_level=0, status="connected"
+        await repo.update_by_agency(
+            agency_id,
+            warning_level=WARN_NONE,
+            status=MetaConnectionStatus.CONNECTED.value,
         )
 
 
 async def process_agency_tokens(
     session: AsyncSession, client: MetaGraphClient, now: datetime
 ) -> None:
-    result = await session.execute(
-        select(AgencySocialConnection).where(
-            AgencySocialConnection.is_primary.is_(True)
-        )
-    )
-    for primary in result.scalars().all():
-        await _process_one_agency(session, client, primary, now)
+    repo = AgencySocialConnectionRepository(session)
+    for primary in await repo.list_primary():
+        await _process_one_agency(session, repo, client, primary, now)
     await session.flush()
 
 
@@ -1188,15 +1590,10 @@ async def meta_token_monitor_loop() -> None:
 
 - [ ] **Step 2: Verify it imports**
 
-Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/python -c "from src.services.meta_token_monitor import process_agency_tokens, meta_token_monitor_loop; print('ok')"`
+Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && .venv/bin/python -c "from src.services.meta_token_monitor import process_agency_tokens, meta_token_monitor_loop; print('ok')"`
 Expected: `ok`
 
-- [ ] **Step 3: Commit**
-
-```bash
-git add src/services/meta_token_monitor.py
-git commit -m "feat(meta): daily token monitor (refresh + warnings)"
-```
+- [ ] **Step 4: Commit** _(SKIP per execution override — leave in working tree)_
 
 ---
 
@@ -1207,29 +1604,27 @@ git commit -m "feat(meta): daily token monitor (refresh + warnings)"
 
 - [ ] **Step 1: Add the method**
 
-Add to the `UserRepository` class (with `from src.models.user import User` and `from sqlalchemy import select` already imported, or add them):
+Add to the `UserRepository` class. Add `from src.constants import UserRole` (and ensure `from src.models.user import User` and `from sqlalchemy import select` are imported):
 
 ```python
     async def get_admins(self) -> list[User]:
         result = await self.session.execute(
             select(User).where(
-                User.role.in_(["owner", "admin"]), User.is_active.is_(True)
+                User.role.in_([UserRole.OWNER.value, UserRole.ADMIN.value]),
+                User.is_active.is_(True),
             )
         )
         return list(result.scalars().all())
 ```
 
+> Use the `UserRole` enum (already in `src/constants.py`) rather than raw `"owner"`/`"admin"` literals — consistent with the `MetaPlatform`/`MetaConnectionStatus` refactor.
+
 - [ ] **Step 2: Verify import**
 
-Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/python -c "from src.db.repositories.user import UserRepository; print(hasattr(UserRepository, 'get_admins'))"`
+Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && .venv/bin/python -c "from src.db.repositories.user import UserRepository; print(hasattr(UserRepository, 'get_admins'))"`
 Expected: `True`
 
-- [ ] **Step 3: Commit**
-
-```bash
-git add src/db/repositories/user.py
-git commit -m "feat(meta): UserRepository.get_admins for reconnect notification"
-```
+- [ ] **Step 3: Commit** _(SKIP per execution override — leave in working tree)_
 
 ---
 
@@ -1262,15 +1657,10 @@ In the teardown block (after `task.cancel()`), add:
 
 - [ ] **Step 3: Verify the app still boots**
 
-Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/python -c "from src.main import app; print('ok')"`
+Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && .venv/bin/python -c "from src.main import app; print('ok')"`
 Expected: `ok`
 
-- [ ] **Step 4: Commit**
-
-```bash
-git add src/main.py
-git commit -m "feat(meta): start token monitor loop in lifespan"
-```
+- [ ] **Step 4: Commit** _(SKIP per execution override — leave in working tree)_
 
 ---
 
@@ -1290,10 +1680,15 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.meta_social import _deobfuscate, _obfuscate
+from src.constants import MetaConnectionStatus, MetaPlatform
+from src.utils import deobfuscate, obfuscate
 from src.models.agency_social_connection import AgencySocialConnection
 from src.services import meta_token_monitor
-from src.services.meta_token_monitor import process_agency_tokens
+from src.services.meta_token_monitor import (
+    WARN_5,
+    WARN_14,
+    process_agency_tokens,
+)
 
 
 class FakeGraphClient:
@@ -1324,15 +1719,15 @@ async def _seed_agency(
     session.add(
         AgencySocialConnection(
             agency_id=agency_id,
-            platform="facebook",
+            platform=MetaPlatform.FACEBOOK.value,
             page_id="PAGE1",
             page_name="Page One",
-            access_token=_obfuscate("page-token"),
+            access_token=obfuscate("page-token"),
             is_primary=True,
-            user_access_token=_obfuscate("old-user-token"),
+            user_access_token=obfuscate("old-user-token"),
             token_expires_at=expires,
             warning_level=0,
-            status="connected",
+            status=MetaConnectionStatus.CONNECTED.value,
         )
     )
     await session.flush()
@@ -1354,26 +1749,18 @@ async def test_refresh_success_resets_state(db_session: AsyncSession):
             )
         )
     ).scalar_one()
-    assert _deobfuscate(row.user_access_token) == "fresh-user-token"
+    assert deobfuscate(row.user_access_token) == "fresh-user-token"
     assert row.warning_level == 0
-    assert row.status == "connected"
-    assert (row.token_expires_at - now).days > WARN_14_DAYS
-
-
-WARN_14_DAYS = 14
+    assert row.status == MetaConnectionStatus.CONNECTED.value
+    assert (row.token_expires_at - now).days > WARN_14
 ```
 
 - [ ] **Step 2: Run it to verify it fails (table/logic wired)**
 
-Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/pytest tests/integration/test_meta_token_monitor.py::test_refresh_success_resets_state -v`
+Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && .venv/bin/pytest tests/integration/test_meta_token_monitor.py::test_refresh_success_resets_state -v`
 Expected: PASS once the service from Task 10 is correct. If it FAILS, read the assertion and fix `meta_token_monitor.py` (this is the implementation-verifying test for the success path).
 
-- [ ] **Step 3: Commit**
-
-```bash
-git add tests/integration/test_meta_token_monitor.py
-git commit -m "test(meta): monitor refresh-success resets warning state"
-```
+- [ ] **Step 3: Commit** _(SKIP per execution override — leave in working tree)_
 
 ---
 
@@ -1412,26 +1799,25 @@ async def test_refresh_failure_sets_needs_reconnect_and_notifies_once(
             )
         )
     ).scalar_one()
-    assert row.status == "needs_reconnect"
+    assert row.status == MetaConnectionStatus.NEEDS_RECONNECT.value
     assert calls["n"] == 1
 ```
 
-> Note: dedupe-to-once works because after the first tick `status="needs_reconnect"`; the second tick still attempts refresh (still ≤14 days) and fails again, so to guarantee "once" the implementation must skip notifying when `status` is already `needs_reconnect`. Add that guard in `_process_one_agency`'s hard-failure branch: only call `notify_reconnect` if `primary.status != "needs_reconnect"`. Update `src/services/meta_token_monitor.py` accordingly, then re-run.
+> Note: dedupe-to-once works because after the first tick `status` is `needs_reconnect`; the second tick still attempts refresh (still ≤14 days) and fails again, so to guarantee "once" the implementation must skip notifying when `status` is already `needs_reconnect`. Add that guard in `_process_one_agency`'s hard-failure branch: only call `notify_reconnect` if `primary.status != MetaConnectionStatus.NEEDS_RECONNECT.value`. Update `src/services/meta_token_monitor.py` accordingly, then re-run.
 
 - [ ] **Step 2: Add the dedupe guard to the service**
 
-In `_process_one_agency`, change the `except MetaGraphError:` branch to:
+In `_process_one_agency`, change the `except MetaGraphError:` branch (from Task 10) to guard the notify, keeping the repository + enum form:
 
 ```python
         except MetaGraphError:
-            if primary.status != "needs_reconnect":
+            if primary.status != MetaConnectionStatus.NEEDS_RECONNECT.value:
                 await notify_reconnect(
                     session, agency_id, primary.connected_by_user_id
                 )
-            await _set_agency(
-                session,
+            await repo.update_by_agency(
                 agency_id,
-                status="needs_reconnect",
+                status=MetaConnectionStatus.NEEDS_RECONNECT.value,
                 last_error="silent refresh failed",
             )
             return
@@ -1439,15 +1825,10 @@ In `_process_one_agency`, change the `except MetaGraphError:` branch to:
 
 - [ ] **Step 3: Run the test**
 
-Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/pytest tests/integration/test_meta_token_monitor.py::test_refresh_failure_sets_needs_reconnect_and_notifies_once -v`
+Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && .venv/bin/pytest tests/integration/test_meta_token_monitor.py::test_refresh_failure_sets_needs_reconnect_and_notifies_once -v`
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
-
-```bash
-git add tests/integration/test_meta_token_monitor.py src/services/meta_token_monitor.py
-git commit -m "test(meta): refresh-failure -> needs_reconnect + notify once"
-```
+- [ ] **Step 4: Commit** _(SKIP per execution override — leave in working tree)_
 
 ---
 
@@ -1485,22 +1866,22 @@ async def test_14_day_warning_then_5_day_then_expired(db_session: AsyncSession):
             )
         )
     ).scalar_one()
-    assert row.warning_level == 14
-    assert row.status == "expiring"
+    assert row.warning_level == WARN_14
+    assert row.status == MetaConnectionStatus.EXPIRING.value
 
     row.token_expires_at = now + timedelta(days=4)
     await db_session.flush()
     client2 = NoExtendGraphClient(days_left=4, now=now)
     await process_agency_tokens(db_session, client2, now)
     await db_session.refresh(row)
-    assert row.warning_level == 5
+    assert row.warning_level == WARN_5
 
     row.token_expires_at = now - timedelta(days=1)
     await db_session.flush()
     client3 = NoExtendGraphClient(days_left=-1, now=now)
     await process_agency_tokens(db_session, client3, now)
     await db_session.refresh(row)
-    assert row.status == "expired"
+    assert row.status == MetaConnectionStatus.EXPIRED.value
 
 
 @pytest.mark.asyncio
@@ -1520,20 +1901,15 @@ async def test_no_action_when_token_healthy(db_session: AsyncSession):
         )
     ).scalar_one()
     assert row.warning_level == 0
-    assert row.status == "connected"
+    assert row.status == MetaConnectionStatus.CONNECTED.value
 ```
 
 - [ ] **Step 2: Run the tests**
 
-Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/pytest tests/integration/test_meta_token_monitor.py -v`
+Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && .venv/bin/pytest tests/integration/test_meta_token_monitor.py -v`
 Expected: all PASS. Fix `meta_token_monitor.py` threshold logic if any fail.
 
-- [ ] **Step 3: Commit**
-
-```bash
-git add tests/integration/test_meta_token_monitor.py
-git commit -m "test(meta): warning thresholds + healthy no-op"
-```
+- [ ] **Step 3: Commit** _(SKIP per execution override — leave in working tree)_
 
 ---
 
@@ -1560,22 +1936,20 @@ async def test_two_agencies_isolated(db_session: AsyncSession):
         await db_session.execute(select(AgencySocialConnection))
     ).scalars().all()
     by_agency = {r.agency_id: r for r in rows}
-    assert by_agency["agency-a"].status == "connected"
+    assert by_agency["agency-a"].status == MetaConnectionStatus.CONNECTED.value
     assert by_agency["agency-a"].warning_level == 0
-    assert by_agency["agency-b"].status in ("expiring", "connected")
+    assert by_agency["agency-b"].status in (
+        MetaConnectionStatus.EXPIRING.value,
+        MetaConnectionStatus.CONNECTED.value,
+    )
 ```
 
 - [ ] **Step 2: Run the full job test file**
 
-Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/pytest tests/integration/test_meta_token_monitor.py -v`
+Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && .venv/bin/pytest tests/integration/test_meta_token_monitor.py -v`
 Expected: all PASS.
 
-- [ ] **Step 3: Commit**
-
-```bash
-git add tests/integration/test_meta_token_monitor.py
-git commit -m "test(meta): per-agency isolation in monitor"
-```
+- [ ] **Step 3: Commit** _(SKIP per execution override — leave in working tree)_
 
 ---
 
@@ -1597,7 +1971,7 @@ psql -d sideline_realestate -c "UPDATE agency_social_connections SET token_expir
 
 Run:
 ```bash
-cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/python -c "
+cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && .venv/bin/python -c "
 import asyncio
 from datetime import datetime, timezone
 from src.db.session import async_session_factory
@@ -1619,11 +1993,7 @@ Expected: log line `meta_graph.error` (refresh failed) and the row status become
 Run: `psql -d sideline_realestate -c "SELECT status, last_error FROM agency_social_connections WHERE is_primary = true;"`
 Expected: `status=needs_reconnect`, `last_error='silent refresh failed'`.
 
-- [ ] **Step 4: Reset the dev row (reconnect via UI) and commit any fixes**
-
-```bash
-git add -A && git commit -m "chore(meta): verify reconnect notification path" --allow-empty
-```
+- [ ] **Step 4: Reset the dev row (reconnect via UI)** _(SKIP commit per execution override — leave any fixes in the working tree)_
 
 ---
 
@@ -1631,12 +2001,12 @@ git add -A && git commit -m "chore(meta): verify reconnect notification path" --
 
 - [ ] **Run the full job test suite**
 
-Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/pytest tests/integration/test_meta_token_monitor.py -v`
+Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && .venv/bin/pytest tests/integration/test_meta_token_monitor.py -v`
 Expected: all PASS.
 
 - [ ] **Backend boots; frontend builds**
 
-Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/python -c "from src.main import app; print('ok')" && cd frontend && npx tsc --noEmit && npm run build`
+Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && .venv/bin/python -c "from src.main import app; print('ok')" && cd frontend && npx tsc --noEmit && npm run build`
 Expected: `ok` + clean type-check + successful build.
 
 - [ ] **Deploy-time only:** run `scripts/migrate_all_tenants.py` to apply the migration to every tenant + `slate_template` (per `CLAUDE.md`). Do NOT run during local dev.
