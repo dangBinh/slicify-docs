@@ -35,8 +35,7 @@
               "title": "2026-06-04-meta-oauth-token-service-design"
             }
           }
-        ],
-        "currentTab": 1
+        ]
       }
     ],
     "direction": "vertical"
@@ -209,10 +208,10 @@
       "obsidian-git:Open Git source control": false
     }
   },
-  "active": "c8b74e9e57a8b9e9",
+  "active": "699e2583e5e31a0f",
   "lastOpenFiles": [
-    "plans/2026-06-04-meta-oauth-token-service.md",
     "specs/2026-06-04-meta-oauth-token-service-design.md",
+    "plans/2026-06-04-meta-oauth-token-service.md",
     "plans",
     "README.md",
     "specs"

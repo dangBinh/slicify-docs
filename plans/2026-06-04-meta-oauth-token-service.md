@@ -36,6 +36,7 @@
 - `frontend/src/api/metaCredentials.ts` — API calls.
 - `frontend/src/pages/MetaSettingsPage.tsx` — `MetaSettingsPanel` (fetches + orchestrates).
 - `frontend/src/components/integrations/MetaAccountCard.tsx` — presentational card.
+- `frontend/src/components/integrations/MetaStatusBanner.tsx` — in-app reconnect/expiry banner (driven by `connection.status`; replaces the email reconnect notice — see Task 10/Milestone 4 as-built).
 
 **Frontend (modify):**
 - `frontend/src/types/index.ts` — `MetaConnection`, `MetaConnectResponse`.
@@ -1405,6 +1406,24 @@ Expected: one row per linked IG Business account, `status=connected`.
 
 > **Refactor-aligned:** keeps the functional `process_agency_tokens(session, client, now)` API (client injected as a parameter — same stateless pattern as `runtime_settings.py`, and what the tests already call), but all DB access goes through `AgencySocialConnectionRepository` / `UserRepository` (no inline `select`/`update`/`session.get`), and statuses use the `MetaConnectionStatus` enum.
 
+> **As-built (re-synced — AUTHORITATIVE; supersedes the "Refactor-aligned" note and the Step 1/Step 2 code blocks below):**
+>
+> - **Class-based service, mirroring `MetaSocialService`.** `class MetaTokenMonitor(session, graph_client=None)` injects `self.session`, `self.connections = AgencySocialConnectionRepository(session)`, and `self.graph = graph_client or MetaGraphClient()` (so tests pass a fake). Logic lives in instance methods: `process_agency_tokens(now)`, `_process_one_agency`, `_refresh_user_token`, `_apply_status`. The loop/driver stays **module-level** (`_run_for_factory`/`_run_default`/`_run_tenant`/`meta_token_monitor_loop`): it owns the session/engine lifecycle and instantiates `MetaTokenMonitor(db, client)` per database (default DB + every tenant), exactly as `MetaSocialService` keeps its stateless OAuth helpers at module level.
+> - **Listing reuses the inherited `BaseRepository.get_all()` — NOT `list_primary()`.** The plan's `list_primary()` filters `AgencySocialConnection.is_primary`, but in the two-table model `is_primary` is a column on `agency_social_accounts`, **not** the connection. There is one connection per agency, so the monitor just iterates `get_all()`. The **only** new repo method is `update_by_agency(agency_id, **values)` (add `update` to the sqlalchemy import). Drop the `list_primary()` block in Step 1.
+> - **`encrypt`/`decrypt`, not `obfuscate`/`deobfuscate`** (Task 5b): `decrypt(connection.user_access_token)` on refresh, `encrypt(refreshed["access_token"])` on store.
+> - **No `notify_reconnect` — in-app notification only.** The refresh-failure branch persists the in-app signal and returns:
+>   ```python
+>   except MetaGraphError:
+>       await self.connections.update_by_agency(
+>           connection.agency_id,
+>           status=MetaConnectionStatus.NEEDS_RECONNECT.value,
+>           last_error="silent refresh failed",
+>       )
+>       return None
+>   ```
+>   `status` is exposed by `MetaConnectionResponse.status` and surfaced in the UI by `frontend/src/components/integrations/MetaStatusBanner.tsx` (red for `needs_reconnect`/`expired`/`error`, amber for `expiring`). This removes the email path entirely — **no `communications` agent, no `send_notification`, and `get_admins` (Task 11) is no longer needed.**
+> - **Verify (Step 2):** `from src.services.meta_token_monitor import MetaTokenMonitor, meta_token_monitor_loop`; exercise via `await MetaTokenMonitor(session, fake_client).process_agency_tokens(now)`.
+
 - [ ] **Step 1: Add the repository methods**
 
 Add to `AgencySocialConnectionRepository` in `src/db/repositories/agency_social_connection.py` (the file from Task 5's refactor):
@@ -1590,7 +1609,7 @@ async def meta_token_monitor_loop() -> None:
 
 - [ ] **Step 2: Verify it imports**
 
-Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && .venv/bin/python -c "from src.services.meta_token_monitor import process_agency_tokens, meta_token_monitor_loop; print('ok')"`
+Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && .venv/bin/python -c "from src.services.meta_token_monitor import MetaTokenMonitor, meta_token_monitor_loop; print('ok')"`
 Expected: `ok`
 
 - [ ] **Step 4: Commit** _(SKIP per execution override — leave in working tree)_
@@ -1598,6 +1617,8 @@ Expected: `ok`
 ---
 
 ### Task 11: Add `get_admins()` to `UserRepository`
+
+> **As-built — NOT required for this feature (skipped).** `get_admins()` existed only to pick admin-fallback recipients for `notify_reconnect`. The monitor no longer sends email — reconnect is surfaced in-app (Task 10 as-built) — so nothing calls `get_admins()`. Leave this task unimplemented unless a future feature needs it; the snippet below still stands if/when it does.
 
 **Files:**
 - Modify: `src/db/repositories/user.py`
@@ -1665,6 +1686,31 @@ Expected: `ok`
 ---
 
 ### Task 13: Integration test — refresh attempted + success resets warning
+
+> **As-built test pattern (AUTHORITATIVE for Tasks 13–16 — the code blocks in these tasks are pre-refactor: they use the old flat table, the functional API, and `obfuscate`/`deobfuscate`). Apply these corrections to every test:**
+>
+> - **Call surface:** `await MetaTokenMonitor(db_session, fake_client).process_agency_tokens(now)` (class-based; inject the fake graph client into the constructor — like the `MetaSocialService` tests). Import `MetaTokenMonitor`, `WARN_5`, `WARN_14` from `src.services.meta_token_monitor`.
+> - **Token codec:** `encrypt`/`decrypt` from `src.utils` (the test env / conftest must set `TOKEN_ENCRYPTION_KEY`).
+> - **Two-table seeding:** build an `AgencySocialConnection` (carrying the lifecycle fields) and append a child `AgencySocialAccount`. The connection has **no** `platform`/`page_id`/`page_name`/`is_primary` columns — those live on the account.
+> - **Selecting the row:** `select(AgencySocialConnection).where(AgencySocialConnection.agency_id == ...)` — **never** `AgencySocialConnection.is_primary` (not a column on the connection).
+> - Corrected seed helper:
+>   ```python
+>   async def _seed_agency(session, agency_id, days_left, now):
+>       conn = AgencySocialConnection(
+>           agency_id=agency_id,
+>           user_access_token=encrypt("old-user-token"),
+>           token_expires_at=now + timedelta(days=days_left),
+>           status=MetaConnectionStatus.CONNECTED.value,
+>           warning_level=0,
+>       )
+>       conn.accounts.append(AgencySocialAccount(
+>           agency_id=agency_id, platform=MetaPlatform.FACEBOOK.value,
+>           provider_id="PAGE1", access_token=encrypt("page-token"),
+>           is_primary=True, authorized=True,
+>       ))
+>       session.add(conn)
+>       await session.flush()
+>   ```
 
 **Files:**
 - Create: `tests/integration/test_meta_token_monitor.py`
@@ -1764,7 +1810,22 @@ Expected: PASS once the service from Task 10 is correct. If it FAILS, read the a
 
 ---
 
-### Task 14: Integration test — hard refresh failure ⇒ needs_reconnect + notify once
+### Task 14: Integration test — hard refresh failure ⇒ needs_reconnect (in-app)
+
+> **As-built — there is no notify to assert; Step 2's dedupe-guard is obsolete.** The monitor no longer calls `notify_reconnect` (in-app notification only — Task 10 as-built), so **drop the `monkeypatch`/`calls` machinery in Step 1 and Step 2 entirely**. The test just asserts the in-app status after a hard failure (writing `needs_reconnect` is idempotent across ticks, so no guard is needed):
+> ```python
+> @pytest.mark.asyncio
+> async def test_refresh_failure_sets_needs_reconnect(db_session):
+>     now = datetime.now(timezone.utc)
+>     await _seed_agency(db_session, "default", days_left=3, now=now)
+>     client = FakeGraphClient(raise_error=True)
+>     await MetaTokenMonitor(db_session, client).process_agency_tokens(now)
+>     row = (await db_session.execute(
+>         select(AgencySocialConnection).where(
+>             AgencySocialConnection.agency_id == "default"))).scalar_one()
+>     assert row.status == MetaConnectionStatus.NEEDS_RECONNECT.value
+>     assert row.last_error == "silent refresh failed"
+> ```
 
 **Files:**
 - Modify: `tests/integration/test_meta_token_monitor.py`
@@ -1953,47 +2014,64 @@ Expected: all PASS.
 
 ---
 
-## Milestone 4 — Reconnect notification verification
+## Milestone 4 — Reconnect notification verification (in-app)
 
-The notification path is implemented in Task 10/Step 2 and covered by the Task 14 test. This milestone is a manual smoke check of the actual `send_notification` wiring.
+Reconnect is surfaced **in-app, not by email** (Task 10 as-built). The monitor writes `status=needs_reconnect` on the connection; the Meta settings panel renders `frontend/src/components/integrations/MetaStatusBanner.tsx`. The status-writing logic is covered by the Task 14 integration test — this milestone manually verifies the **UI surface**.
 
-### Task 17: Manual smoke test of the reconnect notification
+### Task 17: Manual smoke test of the in-app reconnect banner
 
-- [ ] **Step 1: Seed a near-failure agency in the dev DB**
+- [ ] **Step 1: Force the connection into `needs_reconnect`**
 
-Run:
+The monitor's status-writing is covered by the Task 14 test, so set the status directly to isolate the UI check (the local Docker DB; one connection per agency, keyed by `agency_id`, **not** `is_primary`):
+
 ```bash
-psql -d sideline_realestate -c "UPDATE agency_social_connections SET token_expires_at = now() + interval '3 days', user_access_token = 'aW52YWxpZA==' WHERE is_primary = true;"
+docker compose -f docker-compose.local.yml exec -T postgres \
+  psql -U slicify -d sideline_realestate -c \
+  "UPDATE agency_social_connections SET status='needs_reconnect', last_error='silent refresh failed' WHERE agency_id='default';"
 ```
-(`aW52YWxpZA==` is base64 for `invalid`, so the refresh call will fail against Meta.)
 
-- [ ] **Step 2: Trigger one monitor pass manually**
+- [ ] **Step 2: Confirm the in-app banner**
 
-Run:
-```bash
-cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && .venv/bin/python -c "
-import asyncio
-from datetime import datetime, timezone
-from src.db.session import async_session_factory
-from src.integrations.meta_graph import MetaGraphClient
-from src.services.meta_token_monitor import process_agency_tokens
+Open Integrations → Meta (`/integrations?tab=meta`). Expected: a **red** banner above the cards — "Your Meta connection needs to be reconnected…". Set `status='expiring'` instead and reload → an **amber** "expiring soon" banner. (`MetaConnectionResponse.status` → `MetaStatusBanner`.)
 
-async def main():
-    async with async_session_factory() as db:
-        await process_agency_tokens(db, MetaGraphClient(), datetime.now(timezone.utc))
-        await db.commit()
+- [ ] **Step 3: Clear it**
 
-asyncio.run(main())
-"
-```
-Expected: log line `meta_graph.error` (refresh failed) and the row status becomes `needs_reconnect`. With at least one active owner/admin user present, `send_notification` is invoked (in sim/log mode it logs the send).
+Click **Reconnect** on the card (or `UPDATE … SET status='connected'`) → reload → the banner disappears. _(SKIP commit per execution override — leave any fixes in the working tree.)_
 
-- [ ] **Step 3: Verify status**
+---
 
-Run: `psql -d sideline_realestate -c "SELECT status, last_error FROM agency_social_connections WHERE is_primary = true;"`
-Expected: `status=needs_reconnect`, `last_error='silent refresh failed'`.
+### Task 18: Extract shared test doubles + factories into dedicated `tests/fakes/` + `tests/factories/` folders
 
-- [ ] **Step 4: Reset the dev row (reconnect via UI)** _(SKIP commit per execution override — leave any fixes in the working tree)_
+> **Why:** `FakeGraphClient`/`NoExtendGraphClient` (test doubles) and `seed_agency` (data factory) were written inline in `tests/integration/test_meta_token_monitor.py`. They'll be reused by upcoming Meta/social tests (service, API). Keep `conftest.py` for fixtures/wiring only; put importable helper classes/builders in dedicated, purpose-named packages — `tests/fakes/` for doubles, `tests/factories/` for data builders, domain-named files inside each — so they're greppable and shared across the unit/integration tiers.
+
+**Files:**
+- Create: `tests/fakes/__init__.py` (empty)
+- Create: `tests/fakes/meta_graph.py` — `FakeGraphClient`, `NoExtendGraphClient`, `FRESH_USER_TOKEN`, `SECONDS_PER_DAY`
+- Create: `tests/factories/__init__.py` (empty)
+- Create: `tests/factories/social.py` — `async def seed_agency(session, agency_id, days_left, now) -> AgencySocialConnection`
+- Modify: `tests/integration/test_meta_token_monitor.py` — delete the inline doubles + seed helper; import them from `tests.fakes.meta_graph` / `tests.factories.social`
+
+- [ ] **Step 1: Create `tests/fakes/meta_graph.py`** — move `FakeGraphClient`/`NoExtendGraphClient` verbatim (they only implement `refresh_long_lived`, the one method the monitor calls). Keep `SECONDS_PER_DAY`/`FRESH_USER_TOKEN` here so assertions can import the canonical value.
+
+- [ ] **Step 2: Create `tests/factories/social.py`** — move `seed_agency`; have it `return connection` for convenience. Two-table seed (connection + child `AgencySocialAccount`), `encrypt(...)` tokens — never `is_primary` on the connection.
+
+- [ ] **Step 3: Slim the test module** — replace the inline definitions with:
+  ```python
+  from tests.fakes.meta_graph import FakeGraphClient, NoExtendGraphClient, FRESH_USER_TOKEN
+  from tests.factories.social import seed_agency
+  ```
+  Update the call sites (`await seed_agency(db_session, ...)` — unchanged signature). Keep the local `_load` helper (it's specific to these assertions).
+
+- [ ] **Step 4: Run the tests (Docker — no host venv; the slim image has no pytest, install it ad-hoc)**
+
+  ```bash
+  docker compose -f docker-compose.local.yml exec -T backend \
+    python -m pytest tests/integration/test_meta_token_monitor.py -v -p no:cacheprovider
+  ```
+
+  Expected: 5 passed. (The `__init__.py` in each new folder makes them importable packages alongside the existing `tests/__init__.py`.)
+
+- [ ] **Step 5: Commit** _(SKIP per execution override — leave in working tree)_
 
 ---
 
