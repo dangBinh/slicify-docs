@@ -37,10 +37,14 @@
 - `frontend/src/pages/MetaSettingsPage.tsx` — `MetaSettingsPanel` (fetches + orchestrates).
 - `frontend/src/components/integrations/MetaAccountCard.tsx` — presentational card.
 - `frontend/src/components/integrations/MetaStatusBanner.tsx` — in-app reconnect/expiry banner (driven by `connection.status`; replaces the email reconnect notice — see Task 10/Milestone 4 as-built).
+- `frontend/src/lib/metaHealth.ts` — **(M5)** pure `deriveMetaHealth(connection)` + `daysUntil`/`formatConnectionDate` display helpers. Maps `token_expires_at` (real-time day math) + backend `status` to a single `MetaHealth` state consumed by both the card and the banner.
 
 **Frontend (modify):**
-- `frontend/src/types/index.ts` — `MetaConnection`, `MetaConnectResponse`.
+- `frontend/src/types/meta.ts` — `MetaConnection`, `MetaConnectResponse`; **(M5)** `MetaHealthLevel`, `MetaHealth`.
 - `frontend/src/pages/IntegrationsPage.tsx` — add `meta` to `FIXED_TABS` + dispatch the panel.
+- **(M5)** `MetaAccountCard.tsx` — render the connected account name + connection date + token expiry, health-driven status pill (green/amber/red), and a prominent (red) reconnect CTA in the imminent/expired/needs-reconnect states.
+- **(M5)** `MetaStatusBanner.tsx` — switch from raw `status` to the derived `MetaHealth`: amber for `expiring` (≤14d), red + reconnect button for `imminent` (≤5d) / `expired` / `needs_reconnect`.
+- **(M5)** `MetaSettingsPage.tsx` — compute `deriveMetaHealth(connection)` once and pass per-card detail (name/date/expiry) + health to both cards and the banner.
 
 **Constants used across files:** `DEFAULT_AGENCY_ID = "default"` (server-side resolved agency id for v1), `META_OAUTH_COMPLETE = "meta-oauth-complete"` (postMessage string).
 
@@ -2072,6 +2076,705 @@ Click **Reconnect** on the card (or `UPDATE … SET status='connected'`) → rel
   Expected: 5 passed. (The `__init__.py` in each new folder makes them importable packages alongside the existing `tests/__init__.py`.)
 
 - [ ] **Step 5: Commit** _(SKIP per execution override — leave in working tree)_
+
+---
+
+## Milestone 5 — Connected-card detail + real-time amber/red expiry states (UI polish to fully meet the spec)
+
+> **Why this milestone exists (gap against the spec).** The shipped Meta tab connects, gates Instagram behind Facebook, opens the OAuth popup, and shows a Connected / Not-connected pill — but it is **missing three spec requirements**:
+>
+> 1. **"On successful OAuth: update the card to show the connected Page/account name, connection date, and token expiry."** Today the card shows only a pill + button. The data is already in the API response — `MetaConnectionResponse` exposes `connected_at`, `token_expires_at`, and per-account `name`/`username` — it's just never rendered.
+> 2. **"Show clear warning state when token is expiring within 14 days (amber) or 5 days (red)."** The current `MetaStatusBanner` shows a single amber message for `status="expiring"` and does **not** distinguish 14-day (amber) from 5-day (red). It's also driven only by the daily-monitor `status`, which lags reality between ticks.
+> 3. **"Expiring imminently (< 5 days) — red warning with prominent reconnect CTA"** and **"Disconnected / expired — error state with reconnect prompt."** There is no prominent/red reconnect CTA and the cards don't reflect the expired/needs-reconnect state at all.
+>
+> **Approach.** Derive a single `MetaHealth` state on the frontend by combining **`token_expires_at` (real-time day math)** with the backend **`status`** (which alone can express `needs_reconnect`/`error` — states not derivable from a date). The card and the banner both consume that one derived value, so the amber/red thresholds are correct the instant the page loads, independent of when the daily monitor last ran. Thresholds match the backend monitor exactly: **≤14 days → amber, ≤5 days → red, ≤0 → expired**.
+>
+> **No backend or schema change.** Every field is already returned by `GET /api/social/meta/connection`. This milestone is **frontend-only** and, like Milestones 1/2/4, is **verified manually** (the repo has no frontend test runner or date library — confirmed). All code below MUST satisfy `frontend/CLAUDE.md` (no comments, no `as`/`!`, constants `UPPER_SNAKE_CASE`, no inline arrow handlers in JSX props, no nested ternaries, shared types in `types/meta.ts`).
+
+### Task 19: Health-state types + `deriveMetaHealth` helper (pure logic)
+
+**Files:**
+- Modify: `frontend/src/types/meta.ts`
+- Create: `frontend/src/lib/metaHealth.ts`
+
+- [ ] **Step 1: Add the health types**
+
+Append to `frontend/src/types/meta.ts` (the existing file already exports `MetaPlatform`, `MetaAccount`, `MetaConnection`, `MetaConnectResponse` — keep them):
+
+```ts
+export type MetaHealthLevel =
+  | "none"
+  | "healthy"
+  | "expiring"
+  | "imminent"
+  | "expired"
+  | "needs_reconnect";
+
+export interface MetaHealth {
+  level: MetaHealthLevel;
+  daysRemaining: number | null;
+}
+```
+
+- [ ] **Step 2: Write the helper**
+
+Create `frontend/src/lib/metaHealth.ts`:
+
+```ts
+import type {
+  MetaConnection,
+  MetaHealth,
+  MetaHealthLevel,
+} from "../types/meta";
+
+const EXPIRY_AMBER_DAYS = 14;
+const EXPIRY_RED_DAYS = 5;
+const MS_PER_DAY = 1000 * 60 * 60 * 24;
+
+const STATUS_NEEDS_RECONNECT = "needs_reconnect";
+const STATUS_EXPIRED = "expired";
+const STATUS_ERROR = "error";
+
+export function daysUntil(iso: string): number {
+  const target = new Date(iso).getTime();
+  return Math.floor((target - Date.now()) / MS_PER_DAY);
+}
+
+export function formatConnectionDate(iso: string): string {
+  return new Date(iso).toLocaleDateString();
+}
+
+function levelFromDays(days: number): MetaHealthLevel {
+  if (days <= EXPIRY_RED_DAYS) {
+    return "imminent";
+  }
+  if (days <= EXPIRY_AMBER_DAYS) {
+    return "expiring";
+  }
+  return "healthy";
+}
+
+export function deriveMetaHealth(
+  connection: MetaConnection | null | undefined,
+): MetaHealth {
+  if (!connection || connection.accounts.length === 0) {
+    return { level: "none", daysRemaining: null };
+  }
+  if (
+    connection.status === STATUS_NEEDS_RECONNECT ||
+    connection.status === STATUS_ERROR
+  ) {
+    return { level: "needs_reconnect", daysRemaining: null };
+  }
+  if (!connection.token_expires_at) {
+    if (connection.status === STATUS_EXPIRED) {
+      return { level: "expired", daysRemaining: null };
+    }
+    return { level: "healthy", daysRemaining: null };
+  }
+  const days = daysUntil(connection.token_expires_at);
+  if (connection.status === STATUS_EXPIRED || days <= 0) {
+    return { level: "expired", daysRemaining: days };
+  }
+  return { level: levelFromDays(days), daysRemaining: days };
+}
+```
+
+- [ ] **Step 3: Verify it type-checks**
+
+Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate/frontend" && npx tsc --noEmit`
+Expected: no errors referencing `metaHealth.ts` or `MetaHealth`.
+
+- [ ] **Step 4: Verify the threshold boundaries by hand**
+
+There is no frontend test runner, so eyeball `levelFromDays` + `deriveMetaHealth` against this table (these are the exact boundaries the spec calls out and they match the backend monitor's `WARN_14`/`WARN_5`/`≤0`):
+
+| `token_expires_at` vs now   | `status`          | expected `level`  | expected pill colour |
+| --------------------------- | ----------------- | ----------------- | -------------------- |
+| no connection / no accounts | —                 | `none`            | grey                 |
+| +40 days                    | `connected`       | `healthy`         | green                |
+| +15 days                    | `connected`       | `healthy`         | green                |
+| +14 days                    | `connected`       | `expiring`        | amber                |
+| +6 days                     | `connected`       | `expiring`        | amber                |
+| +5 days                     | `connected`       | `imminent`        | red                  |
+| +1 day                      | `connected`       | `imminent`        | red                  |
+| 0 / past                    | `connected`       | `expired`         | red                  |
+| any                         | `expired`         | `expired`         | red                  |
+| any                         | `needs_reconnect` | `needs_reconnect` | red                  |
+| any                         | `error`           | `needs_reconnect` | red                  |
+
+- [ ] **Step 5: Commit** _(SKIP per execution override — leave in working tree)_
+
+---
+
+### Task 20: `MetaAccountCard` — render connected detail + health pill + prominent reconnect CTA
+
+**Files:**
+- Modify: `frontend/src/components/integrations/MetaAccountCard.tsx`
+
+- [ ] **Step 1: Replace the card with the detail-aware version**
+
+Overwrite `frontend/src/components/integrations/MetaAccountCard.tsx` with the full file below. New optional props (`accountName`, `connectedAt`, `expiresAt`, `health`) are additive — the panel (Task 22) supplies them. When `connected` is false the card ignores `health` and shows the grey "Not connected" pill + primary "Connect" button (so the Instagram card stays in its not-connected state even while the Facebook connection is expiring). `MetaConnectedDetail` is a file-local presentational helper (not exported) to keep the card's JSX flat:
+
+```tsx
+import type { MetaHealth, MetaHealthLevel } from "../../types/meta";
+import { formatConnectionDate } from "../../lib/metaHealth";
+
+type HealthColor = "green" | "amber" | "red" | "gray";
+
+interface MetaAccountCardProps {
+  title: string;
+  subtitle: string;
+  iconBg: string;
+  iconChar: string;
+  connected: boolean;
+  disabled: boolean;
+  buttonLabel: string;
+  onConnect: () => void;
+  accountName?: string | null;
+  connectedAt?: string | null;
+  expiresAt?: string | null;
+  health?: MetaHealth;
+}
+
+interface MetaConnectedDetailProps {
+  accountName?: string | null;
+  connectedAt?: string | null;
+  expiresAt?: string | null;
+  expiryClass: string;
+  expirySuffixText: string;
+}
+
+const RECONNECT_LABEL = "Reconnect";
+const NOT_CONNECTED_LABEL = "Not connected";
+const CONNECTED_LABEL = "Connected";
+const EXPIRED_LABEL = "Expired";
+const RECONNECT_NEEDED_LABEL = "Reconnect needed";
+
+const PILL_BASE =
+  "inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium";
+const PILL_BY_COLOR: Record<HealthColor, string> = {
+  green: "bg-green-50 text-green-700",
+  amber: "bg-amber-50 text-amber-700",
+  red: "bg-red-50 text-red-700",
+  gray: "bg-gray-100 text-gray-600",
+};
+const DOT_BY_COLOR: Record<HealthColor, string> = {
+  green: "bg-green-500",
+  amber: "bg-amber-500",
+  red: "bg-red-500",
+  gray: "bg-gray-400",
+};
+const EXPIRY_TEXT_BY_COLOR: Record<HealthColor, string> = {
+  green: "text-gray-600",
+  amber: "text-amber-700 font-medium",
+  red: "text-red-700 font-medium",
+  gray: "text-gray-600",
+};
+
+const CARD_BASE = "rounded-xl border p-6 shadow-sm";
+const CARD_ACTIVE = "border-gray-200 bg-white";
+const CARD_MUTED = "border-gray-200 bg-gray-50 opacity-75";
+
+const BUTTON_BASE =
+  "mt-4 rounded-lg px-4 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-50";
+const BUTTON_PRIMARY = "bg-indigo-600 text-white hover:bg-indigo-700";
+const BUTTON_SECONDARY =
+  "border border-gray-300 bg-white text-gray-700 hover:bg-gray-50";
+const BUTTON_DANGER = "bg-red-600 text-white hover:bg-red-700";
+
+const PROMINENT_LEVELS: MetaHealthLevel[] = [
+  "imminent",
+  "expired",
+  "needs_reconnect",
+];
+
+function effectiveLevel(
+  connected: boolean,
+  health?: MetaHealth,
+): MetaHealthLevel {
+  if (!connected) {
+    return "none";
+  }
+  return health?.level ?? "healthy";
+}
+
+function colorForLevel(level: MetaHealthLevel): HealthColor {
+  if (level === "healthy") {
+    return "green";
+  }
+  if (level === "expiring") {
+    return "amber";
+  }
+  if (level === "none") {
+    return "gray";
+  }
+  return "red";
+}
+
+function pillLabelForLevel(level: MetaHealthLevel, days: number | null): string {
+  if (level === "none") {
+    return NOT_CONNECTED_LABEL;
+  }
+  if (level === "healthy") {
+    return CONNECTED_LABEL;
+  }
+  if (level === "expired") {
+    return EXPIRED_LABEL;
+  }
+  if (level === "needs_reconnect") {
+    return RECONNECT_NEEDED_LABEL;
+  }
+  return `Expires in ${days}d`;
+}
+
+function buttonClassForState(connected: boolean, prominent: boolean): string {
+  if (!connected) {
+    return BUTTON_PRIMARY;
+  }
+  if (prominent) {
+    return BUTTON_DANGER;
+  }
+  return BUTTON_SECONDARY;
+}
+
+function expirySuffix(days: number | null): string {
+  if (days === null || days <= 0) {
+    return "";
+  }
+  return ` (in ${days} days)`;
+}
+
+function MetaConnectedDetail(props: MetaConnectedDetailProps) {
+  return (
+    <div className="mt-4 space-y-1 text-sm">
+      {props.accountName && (
+        <p className="font-medium text-gray-800">{props.accountName}</p>
+      )}
+      {props.connectedAt && (
+        <p className="text-gray-600">
+          Connected {formatConnectionDate(props.connectedAt)}
+        </p>
+      )}
+      {props.expiresAt && (
+        <p className={props.expiryClass}>
+          Token expires {formatConnectionDate(props.expiresAt)}
+          {props.expirySuffixText}
+        </p>
+      )}
+    </div>
+  );
+}
+
+export function MetaAccountCard(props: MetaAccountCardProps) {
+  const level = effectiveLevel(props.connected, props.health);
+  const days = props.health?.daysRemaining ?? null;
+  const color = colorForLevel(level);
+  const prominent = PROMINENT_LEVELS.includes(level);
+  const buttonLabel = props.connected ? RECONNECT_LABEL : props.buttonLabel;
+  const buttonClass = buttonClassForState(props.connected, prominent);
+  const muted = props.disabled && !props.connected;
+  const cardClass = muted ? CARD_MUTED : CARD_ACTIVE;
+  return (
+    <div className={`${CARD_BASE} ${cardClass}`}>
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-4">
+          <div
+            className={`flex h-10 w-10 items-center justify-center rounded-lg text-lg font-bold text-white ${props.iconBg}`}
+          >
+            {props.iconChar}
+          </div>
+          <div>
+            <p className="font-semibold text-gray-900">{props.title}</p>
+            <p className="text-sm text-gray-500">{props.subtitle}</p>
+          </div>
+        </div>
+        <span className={`${PILL_BASE} ${PILL_BY_COLOR[color]}`}>
+          <span className={`h-1.5 w-1.5 rounded-full ${DOT_BY_COLOR[color]}`} />
+          {pillLabelForLevel(level, days)}
+        </span>
+      </div>
+      {props.connected && (
+        <MetaConnectedDetail
+          accountName={props.accountName}
+          connectedAt={props.connectedAt}
+          expiresAt={props.expiresAt}
+          expiryClass={EXPIRY_TEXT_BY_COLOR[color]}
+          expirySuffixText={expirySuffix(days)}
+        />
+      )}
+      <button
+        type="button"
+        onClick={props.onConnect}
+        disabled={props.disabled}
+        className={`${BUTTON_BASE} ${buttonClass}`}
+      >
+        {buttonLabel}
+      </button>
+    </div>
+  );
+}
+```
+
+- [ ] **Step 2: Verify it type-checks and builds**
+
+Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate/frontend" && npx tsc --noEmit`
+Expected: no errors. (The panel still passes the old prop set until Task 22 — `accountName`/`connectedAt`/`expiresAt`/`health` are optional, so the existing call sites keep compiling.)
+
+- [ ] **Step 3: Commit** _(SKIP per execution override — leave in working tree)_
+
+---
+
+### Task 21: `MetaStatusBanner` — amber (≤14d) / red (≤5d) via `MetaHealth` + reconnect CTA
+
+**Files:**
+- Modify: `frontend/src/components/integrations/MetaStatusBanner.tsx`
+
+- [ ] **Step 1: Replace the banner with the health-driven version**
+
+Overwrite `frontend/src/components/integrations/MetaStatusBanner.tsx`. It now takes the derived `MetaHealth` plus an `onReconnect` callback. Amber for `expiring`; red + a prominent **Reconnect** button for `imminent`/`expired`/`needs_reconnect`; nothing for `none`/`healthy`:
+
+```tsx
+import type { MetaHealth, MetaHealthLevel } from "../../types/meta";
+
+const BANNER_BASE =
+  "flex items-center justify-between gap-4 rounded-lg px-4 py-3 text-sm";
+const BANNER_RED = "bg-red-50 text-red-700";
+const BANNER_AMBER = "bg-amber-50 text-amber-700";
+const RECONNECT_BUTTON =
+  "shrink-0 rounded-lg bg-red-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-700";
+
+const RED_LEVELS: MetaHealthLevel[] = [
+  "imminent",
+  "expired",
+  "needs_reconnect",
+];
+
+const MESSAGE_NEEDS_RECONNECT =
+  "Your Meta connection needs to be reconnected. Reconnect to restore posting to Facebook and Instagram.";
+const MESSAGE_EXPIRED =
+  "Your Meta connection has expired. Reconnect to restore posting to Facebook and Instagram.";
+
+interface MetaStatusBannerProps {
+  health: MetaHealth;
+  onReconnect: () => void;
+}
+
+function bannerMessage(health: MetaHealth): string {
+  if (health.level === "needs_reconnect") {
+    return MESSAGE_NEEDS_RECONNECT;
+  }
+  if (health.level === "expired") {
+    return MESSAGE_EXPIRED;
+  }
+  if (health.level === "imminent") {
+    return `Your Meta connection expires in ${health.daysRemaining} days. Reconnect now to avoid an interruption.`;
+  }
+  return `Your Meta connection expires in ${health.daysRemaining} days. Reconnect soon to avoid an interruption.`;
+}
+
+export function MetaStatusBanner({ health, onReconnect }: MetaStatusBannerProps) {
+  if (health.level === "none" || health.level === "healthy") {
+    return null;
+  }
+  const isRed = RED_LEVELS.includes(health.level);
+  const tone = isRed ? BANNER_RED : BANNER_AMBER;
+  return (
+    <div className={`${BANNER_BASE} ${tone}`}>
+      <span>{bannerMessage(health)}</span>
+      {isRed && (
+        <button type="button" onClick={onReconnect} className={RECONNECT_BUTTON}>
+          Reconnect
+        </button>
+      )}
+    </div>
+  );
+}
+```
+
+- [ ] **Step 2: Verify type-check**
+
+Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate/frontend" && npx tsc --noEmit`
+Expected: this will report an error in `MetaSettingsPage.tsx` (still passes `status={...}` to the banner) — that's expected and fixed in Task 22. No error inside `MetaStatusBanner.tsx` itself.
+
+- [ ] **Step 3: Commit** _(SKIP per execution override — leave in working tree)_
+
+---
+
+### Task 22: `MetaSettingsPanel` — wire health + per-card detail; align card copy to the spec
+
+**Files:**
+- Modify: `frontend/src/pages/MetaSettingsPage.tsx`
+
+- [ ] **Step 1: Replace the panel with the wired-up version**
+
+Overwrite `frontend/src/pages/MetaSettingsPage.tsx`. It derives `health` once via `deriveMetaHealth`, resolves the Facebook and Instagram accounts from the connection's nested `accounts`, and feeds each card its name + the connection-level date/expiry + the shared `health`. Card titles now read "Facebook Page" / "Instagram Business" to match the spec, and the Instagram subtitle reflects its connected state. Reconnect (card or banner) re-runs the Facebook connect, which refreshes the user token:
+
+```tsx
+import { useEffect } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  fetchMetaConnection,
+  metaConnectFacebook,
+  metaConnectInstagram,
+} from "../api/metaCredentials";
+import type { MetaConnectResponse } from "../types/meta";
+import { deriveMetaHealth } from "../lib/metaHealth";
+import { MetaAccountCard } from "../components/integrations/MetaAccountCard";
+import { MetaStatusBanner } from "../components/integrations/MetaStatusBanner";
+
+const META_OAUTH_COMPLETE = "meta-oauth-complete";
+const POPUP_FEATURES = "width=600,height=700";
+const POPUP_NAME = "meta-oauth";
+const CONNECTION_KEY = ["meta-connection"];
+const PLATFORM_FACEBOOK = "facebook";
+const PLATFORM_INSTAGRAM = "instagram";
+
+const FACEBOOK_TITLE = "Facebook Page";
+const FACEBOOK_SUBTITLE = "Publish posts to your Facebook Page";
+const FACEBOOK_BUTTON = "Connect Facebook";
+const INSTAGRAM_TITLE = "Instagram Business";
+const INSTAGRAM_BUTTON = "Connect Instagram";
+const INSTAGRAM_SUBTITLE_CONNECTED =
+  "Publish posts to your Instagram Business account";
+const INSTAGRAM_SUBTITLE_DISCONNECTED = "Connect your Facebook Page first";
+
+function openBlankPopup() {
+  return window.open("", POPUP_NAME, POPUP_FEATURES);
+}
+
+function navigatePopup(popup: Window | null, data: MetaConnectResponse) {
+  if (!popup) {
+    return;
+  }
+  popup.location.href = data.authorize_url;
+}
+
+export function MetaSettingsPanel() {
+  const queryClient = useQueryClient();
+  const { data: connection } = useQuery({
+    queryKey: CONNECTION_KEY,
+    queryFn: fetchMetaConnection,
+  });
+
+  const facebookMutation = useMutation({ mutationFn: metaConnectFacebook });
+  const instagramMutation = useMutation({ mutationFn: metaConnectInstagram });
+
+  useEffect(() => {
+    function handler(event: MessageEvent) {
+      if (event.data === META_OAUTH_COMPLETE) {
+        queryClient.invalidateQueries({ queryKey: CONNECTION_KEY });
+      }
+    }
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  }, [queryClient]);
+
+  const accounts = connection?.accounts ?? [];
+  const facebookAccount = accounts.find((a) => a.platform === PLATFORM_FACEBOOK);
+  const instagramAccount = accounts.find(
+    (a) => a.platform === PLATFORM_INSTAGRAM,
+  );
+  const facebookConnected = Boolean(facebookAccount);
+  const instagramConnected = Boolean(instagramAccount);
+  const health = deriveMetaHealth(connection);
+  const instagramName = instagramAccount?.username ?? instagramAccount?.name;
+  const instagramSubtitle = instagramConnected
+    ? INSTAGRAM_SUBTITLE_CONNECTED
+    : INSTAGRAM_SUBTITLE_DISCONNECTED;
+
+  function handleConnectFacebook() {
+    const popup = openBlankPopup();
+    facebookMutation.mutate(undefined, {
+      onSuccess: (data) => navigatePopup(popup, data),
+      onError: () => popup?.close(),
+    });
+  }
+  function handleConnectInstagram() {
+    const popup = openBlankPopup();
+    instagramMutation.mutate(undefined, {
+      onSuccess: (data) => navigatePopup(popup, data),
+      onError: () => popup?.close(),
+    });
+  }
+
+  return (
+    <div className="px-8 py-6">
+      <div className="mx-auto max-w-2xl space-y-5">
+        <div>
+          <h3 className="font-semibold text-gray-900">Connected accounts</h3>
+          <p className="text-sm text-gray-500">
+            Connect your Facebook Page first — Instagram requires a linked
+            Facebook Page.
+          </p>
+        </div>
+        <MetaStatusBanner health={health} onReconnect={handleConnectFacebook} />
+        <MetaAccountCard
+          title={FACEBOOK_TITLE}
+          subtitle={FACEBOOK_SUBTITLE}
+          iconBg="bg-blue-600"
+          iconChar="f"
+          connected={facebookConnected}
+          disabled={false}
+          buttonLabel={FACEBOOK_BUTTON}
+          onConnect={handleConnectFacebook}
+          accountName={facebookAccount?.name}
+          connectedAt={connection?.connected_at}
+          expiresAt={connection?.token_expires_at}
+          health={health}
+        />
+        <MetaAccountCard
+          title={INSTAGRAM_TITLE}
+          subtitle={instagramSubtitle}
+          iconBg="bg-pink-500"
+          iconChar="IG"
+          connected={instagramConnected}
+          disabled={!facebookConnected}
+          buttonLabel={INSTAGRAM_BUTTON}
+          onConnect={handleConnectInstagram}
+          accountName={instagramName}
+          connectedAt={connection?.connected_at}
+          expiresAt={connection?.token_expires_at}
+          health={health}
+        />
+      </div>
+    </div>
+  );
+}
+```
+
+- [ ] **Step 2: Verify type-check and build**
+
+Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate/frontend" && npx tsc --noEmit && npm run build`
+Expected: no type errors; build succeeds.
+
+- [ ] **Step 3: Commit** _(SKIP per execution override — leave in working tree)_
+
+---
+
+### Task 23: Manual verification of all five states (Milestone 5)
+
+> The five spec states are driven by `token_expires_at` (amber/red/expired computed real-time on the frontend) and `status` (`needs_reconnect`). Because the amber/red thresholds are derived from the expiry date, you can exercise them by editing `token_expires_at` directly — **no need to wait for the daily monitor**. All updates target the single per-agency `agency_social_connections` row (keyed by `agency_id='default'`, the local dev agency), mirroring Task 17. Run the frontend (`cd frontend && npm run dev`) and the Docker backend, open Integrations → Meta (`/integrations?tab=meta`), and reload after each `UPDATE`.
+
+- [ ] **Step 1: Not connected**
+
+With no connection row (`DELETE FROM agency_social_connections WHERE agency_id='default';`), reload. Expected: both cards show a grey **Not connected** pill, no detail rows, no banner; the Facebook button is the primary "Connect Facebook"; the Instagram card is **disabled and visibly greyed/muted** (`CARD_MUTED` — faded background + reduced opacity) with a disabled button.
+
+- [ ] **Step 2: Connected (healthy) — proves the name/date/expiry requirement**
+
+Connect Facebook for real (or set a healthy expiry on an existing row):
+
+```bash
+docker compose -f docker-compose.local.yml exec -T postgres \
+  psql -U slicify -d sideline_realestate -c \
+  "UPDATE agency_social_connections SET token_expires_at = now() + interval '40 days', status='connected', warning_level=0 WHERE agency_id='default';"
+```
+
+Expected on the Facebook card: green **Connected** pill, the **Page name** line, **"Connected {date}"**, and **"Token expires {date} (in 40 days)"** in grey. No banner.
+
+- [ ] **Step 3: Expiring soon (< 14 days) — amber**
+
+```bash
+docker compose -f docker-compose.local.yml exec -T postgres \
+  psql -U slicify -d sideline_realestate -c \
+  "UPDATE agency_social_connections SET token_expires_at = now() + interval '10 days', status='connected' WHERE agency_id='default';"
+```
+
+Expected: amber pill reading **"Expires in 10d"**, the expiry line in amber, and an **amber banner** ("expires in 10 days … Reconnect soon") with **no** Reconnect button.
+
+- [ ] **Step 4: Expiring imminently (< 5 days) — red + prominent CTA**
+
+```bash
+docker compose -f docker-compose.local.yml exec -T postgres \
+  psql -U slicify -d sideline_realestate -c \
+  "UPDATE agency_social_connections SET token_expires_at = now() + interval '3 days', status='connected' WHERE agency_id='default';"
+```
+
+Expected: red pill **"Expires in 3d"**, red expiry line, the card's reconnect button rendered as the **red (danger) "Reconnect"**, and a **red banner** with a prominent **Reconnect** button.
+
+- [ ] **Step 5: Expired**
+
+```bash
+docker compose -f docker-compose.local.yml exec -T postgres \
+  psql -U slicify -d sideline_realestate -c \
+  "UPDATE agency_social_connections SET token_expires_at = now() - interval '1 day', status='expired' WHERE agency_id='default';"
+```
+
+Expected: red **Expired** pill, red banner ("has expired … Reconnect") with the prominent Reconnect button.
+
+- [ ] **Step 6: Disconnected / needs reconnect (refresh-failure state)**
+
+```bash
+docker compose -f docker-compose.local.yml exec -T postgres \
+  psql -U slicify -d sideline_realestate -c \
+  "UPDATE agency_social_connections SET status='needs_reconnect', last_error='silent refresh failed' WHERE agency_id='default';"
+```
+
+Expected: red **Reconnect needed** pill, red banner ("needs to be reconnected … Reconnect") with the prominent Reconnect button. Clicking **Reconnect** (card or banner) opens the OAuth popup; completing it returns the row to healthy and clears the banner.
+
+- [ ] **Step 7: Instagram gating still holds**
+
+Confirm the Instagram card stays disabled (greyed/muted via `CARD_MUTED`) with the **"Connect your Facebook Page first"** subtitle while `facebook` is the only connected account, and that an amber/red Facebook expiry does **not** flip the disabled Instagram card's pill (it remains grey "Not connected" until an `instagram` account exists). _(SKIP commit per execution override — leave any fixes in the working tree.)_
+
+---
+
+## Milestone 6 — Tighten silent-refresh trigger to the final day (post-launch change)
+
+> **Why.** Milestone 3 shipped with the silent refresh firing at the **same ≤14-day threshold** as the first expiry warning (`days_remaining <= WARN_14`). Per the as-built honesty caveat in Milestone 3, `fb_exchange_token` does **not** reset the 60-day clock for server-side apps and Page tokens stay valid while the user token does — so refreshing 14 days out mostly re-stored a token with ~the same remaining lifetime and pre-empted the warning path. This change **decouples refresh from the warnings**: keep the 14-day / 5-day **warnings** as the user-facing signal, and only attempt the silent refresh in the **final day** before expiry, when an extension is actually meaningful (and the token is comfortably past Meta's 24h-minimum-age rule). The warning → reconnect backstop is unchanged.
+
+### Task 24: Refresh trigger threshold 14d → 1d (with test)
+
+> **As-built — implemented and verified (tests green; not yet committed — left in working tree per the execution override).** Decouples the refresh trigger from `WARN_14`; the warnings (`WARN_14`/`WARN_5`) and `_apply_status` are untouched. `.days` truncation means `<= REFRESH_THRESHOLD_DAYS` (1) fires once under ~2 days remain (i.e. before the token drops under a day) and on already-expired tokens.
+
+**Files:**
+- Modify: `src/services/meta_token_monitor.py`
+- Modify: `tests/integration/test_meta_token_monitor.py`
+
+- [x] **Step 1 (RED): pin the new behaviour with a failing test**
+
+Added `test_no_refresh_outside_final_day` to `tests/integration/test_meta_token_monitor.py`: seed a connection with `days_left=10`, run `process_agency_tokens(now)`, assert `client.refresh_calls == 0` and that the row is warned instead (`warning_level == WARN_14`, `status == EXPIRING`). Against the old `<= WARN_14` code this fails with `refresh_calls == 1` (refresh fired at 10 days) — confirmed RED for the right reason.
+
+- [x] **Step 2 (GREEN): introduce a dedicated threshold constant**
+
+In `src/services/meta_token_monitor.py`, add `REFRESH_THRESHOLD_DAYS = 1` next to the `WARN_*` constants and change the trigger in `_process_one_agency`:
+
+```python
+days_remaining = (connection.token_expires_at - now).days
+if days_remaining <= REFRESH_THRESHOLD_DAYS:   # was: <= WARN_14
+    new_expiry = await self._refresh_user_token(connection, now)
+```
+
+`WARN_14` is still used by `_apply_status` for the 14-day warning level — only the refresh trigger changed.
+
+- [x] **Step 3: re-tune the two refresh-path tests to the tighter window**
+
+`test_refresh_success_resets_state` and `test_refresh_failure_sets_needs_reconnect` seeded `days_left=10`/`days_left=3`, which no longer trigger a refresh under the 1-day threshold. Changed both to `days_left=1` so they still exercise the refresh path. `test_14_day_warning_then_5_day_then_expired`, `test_no_action_when_token_healthy`, and `test_two_agencies_isolated` pass unchanged (their warning/expiry assertions don't depend on the refresh trigger).
+
+- [x] **Step 4: run the suite (GREEN)**
+
+Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && DB_USER=slicify DB_PASSWORD=slicify DB_HOST=localhost DB_PORT=5432 DB_DATABASE=sideline_realestate TOKEN_ENCRYPTION_KEY=<fernet-key> .venv/bin/python -m pytest tests/integration/test_meta_token_monitor.py -v`
+Expected: `6 passed` (the 5 originals + `test_no_refresh_outside_final_day`).
+
+> **Local-env notes (one-time, discovered during execution):** the committed `.venv/` was stale (built at the old `/Volumes/T7/...` path before the repo moved) — recreate with `/opt/homebrew/bin/python3.12 -m venv .venv` (the pinned deps lack Python 3.14 wheels). `TOKEN_ENCRYPTION_KEY` isn't in `.env`, so generate an ephemeral Fernet key just for the test run (`.venv/bin/python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`). DB creds come from `.env.local` (`slicify`/`slicify@localhost`), passed as env-var overrides.
+
+- [x] **Step 5: Commit** _(SKIP per execution override — leave in working tree)_
+
+> **Manual test SQL (new threshold).** To make the daily job refresh on its next pass, set the expiry under a day; ≥2 days only warns. Local `sideline_realestate` DB only:
+>
+> ```sql
+> -- triggers refresh on next pass (.days = 0 → <= REFRESH_THRESHOLD_DAYS)
+> UPDATE agency_social_connections
+> SET token_expires_at = now() + interval '12 hours',
+>     status = 'connected', warning_level = 0, last_refreshed_at = NULL
+> WHERE user_access_token IS NOT NULL;
+>
+> -- negative check: no refresh, warns only
+> -- SET token_expires_at = now() + interval '2 days'
+> -- expired: refresh attempted (→ needs_reconnect if the token is invalid)
+> -- SET token_expires_at = now() - interval '1 hour'
+> ```
+>
+> The refresh calls Meta's Graph API for real, so `user_access_token` must be a genuine long-lived token for a successful extend; otherwise the row flips to `needs_reconnect`.
 
 ---
 
