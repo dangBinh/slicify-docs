@@ -1329,11 +1329,11 @@ After editing `.env.local`, restart the backend so config reloads:
 
 **Pre-req — Meta app dashboard.** A real Meta app must exist, and **three different fields** must be configured (each rejects a different format — domain vs full URL):
 
-| Dashboard field | Location | Value |
-| --- | --- | --- |
-| **App Domains** | Settings → Basic | `local.slatedev.com` (bare domain) |
-| **Valid OAuth Redirect URIs** | Facebook Login → Settings | `https://local.slatedev.com/api/auth/meta/callback` (full URL) |
-| **Allowed Domains for redirect** | Facebook Login → Settings | `local.slatedev.com` (bare domain) |
+| Dashboard field                  | Location                  | Value                                                          |
+| -------------------------------- | ------------------------- | -------------------------------------------------------------- |
+| **App Domains**                  | Settings → Basic          | `local.slatedev.com` (bare domain)                             |
+| **Valid OAuth Redirect URIs**    | Facebook Login → Settings | `https://local.slatedev.com/api/auth/meta/callback` (full URL) |
+| **Allowed Domains for redirect** | Facebook Login → Settings | `local.slatedev.com` (bare domain)                             |
 
 Use the **Redirect URI Validator** on the Facebook Login → Settings page to confirm the full callback URL turns green before testing.
 
