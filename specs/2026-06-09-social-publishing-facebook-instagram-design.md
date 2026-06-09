@@ -104,18 +104,17 @@ One model per file under `src/models/`. No secrets stored here (tokens already l
 
 ### 5.1 `Post` — `posts` (the shared content envelope)
 
-| field | type | notes |
-| --- | --- | --- |
-| `id` | UUID PK | |
-| `agency_id` | str(100), indexed | scope key |
-| `listing_id` | UUID FK→listings, nullable | optional real-estate context |
-| `content` | Text, nullable | shared post text/caption |
-| `status` | str(20) | `scheduled` → `publishing` → `published` / `partially_failed` / `failed` / `cancelled` |
-| `scheduled_at` | datetime tz, nullable | set only by `/schedule` |
-| `published_at` | datetime tz, nullable | when all targets terminal |
-| `needs_attention` | bool, default false | flips on terminal failure (mirrors groups pattern) |
-| `created_by_user_id` | UUID FK→users, nullable | |
-| `created_at` / `updated_at` | timestamps | |
+| field                       | type                       | notes                                                                                  |
+| --------------------------- | -------------------------- | -------------------------------------------------------------------------------------- |
+| `id`                        | UUID PK                    |                                                                                        |
+| `agency_id`                 | str(100), indexed          | scope key                                                                              |
+| `content`                   | Text, nullable             | shared post text/caption                                                               |
+| `status`                    | str(20)                    | `scheduled` → `publishing` → `published` / `partially_failed` / `failed` / `cancelled` |
+| `scheduled_at`              | datetime tz, nullable      | set only by `/schedule`                                                                |
+| `published_at`              | datetime tz, nullable      | when all targets terminal                                                              |
+| `needs_attention`           | bool, default false        | flips on terminal failure (mirrors groups pattern)                                     |
+| `created_by_user_id`        | UUID FK→users, nullable    |                                                                                        |
+| `created_at` / `updated_at` | timestamps                 |                                                                                        |
 
 ### 5.2 `PostTarget` — `post_targets` (fan-out + per-account retry state)
 
@@ -233,7 +232,6 @@ PostPublishRequest:
   content:     str | None
   media_ids:   list[UUID]   # 0–10, must be unattached + owned by agency
   account_ids: list[UUID]   # ≥1 AgencySocialAccount ids (platform toggle → account map done client-side)
-  listing_id:  UUID | None
 
 PostScheduleRequest(PostPublishRequest):
   scheduled_at: datetime    # tz-aware, strictly future (≥ 1 min lead)
