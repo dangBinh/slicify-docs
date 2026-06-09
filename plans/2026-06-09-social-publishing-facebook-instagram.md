@@ -23,6 +23,18 @@ Source spec: `slicify-docs/specs/2026-06-09-social-publishing-facebook-instagram
 - Functions < 20 lines preferred, ≤ 100 max; max 1 nesting level; early returns.
 - `structlog.get_logger()` only. Named constants for any repeated literal.
 
+## Testing scope (limited to critical paths + core functionality)
+
+Integration tests cover **only** the critical paths and core behaviors, not exhaustive permutations:
+
+- Executor success path — Facebook single image **and** Instagram container flow.
+- The three required error behaviors — expired token → `needs_reconnect`, rate limit → retry with reset, media rejection mapping.
+- Attempt logging is asserted within the expired-token executor test.
+- Scheduled-post firing (poller publishes a due post).
+- The two highest-value API guards — Instagram-requires-media and unauthorized-account → reconnect `400`.
+
+Everything else (URL-resolver fallback/none cases, default rate-limit reset, expired/unknown error-mapping unit cases, retry-due poller wiring, basic 422s) is left to manual/code-review verification. **~12 integration tests total.**
+
 ## Environment
 
 - Backend root: `/Users/binhquach/Workplace/Slicify AI/slicify-realestate`
@@ -796,32 +808,10 @@ git commit -m "feat(social): repositories for posts, targets, media, attempts, a
 
 **Files:**
 - Modify: `src/services/storage.py`
-- Test: `tests/integration/test_social_media_url.py` (shares the file with Task 7)
 
-- [ ] **Step 1: Write the failing test**
+> Backward-compatible signature change — existing callers keep the default content type, so the existing suite already covers it. No new test here (limited-testing scope).
 
-Create `tests/integration/test_social_media_url.py`:
-
-```python
-from src.services.storage import LocalStorageService
-
-
-def test_local_upload_accepts_content_type(tmp_path, monkeypatch):
-    import src.services.storage as storage_module
-
-    monkeypatch.setattr(storage_module, "_STORAGE_ROOT", tmp_path)
-    service = LocalStorageService()
-    key = service.upload_file(b"abc", "posts/x/img.jpg", content_type="image/jpeg")
-    assert key == "posts/x/img.jpg"
-    assert (tmp_path / "posts/x/img.jpg").read_bytes() == b"abc"
-```
-
-- [ ] **Step 2: Run it — expect failure**
-
-Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/pytest tests/integration/test_social_media_url.py::test_local_upload_accepts_content_type -v`
-Expected: FAIL — `TypeError: upload_file() got an unexpected keyword argument 'content_type'`
-
-- [ ] **Step 3: Add the parameter to both services**
+- [ ] **Step 1: Add the parameter to both services**
 
 In `src/services/storage.py`, change `LocalStorageService.upload_file`:
 
@@ -853,15 +843,15 @@ And `SpacesStorageService.upload_file`:
         return url
 ```
 
-- [ ] **Step 4: Run it — expect pass**
+- [ ] **Step 2: Verify the existing suite still passes (no regression)**
 
-Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/pytest tests/integration/test_social_media_url.py::test_local_upload_accepts_content_type -v`
-Expected: PASS
+Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/pytest tests/integration/test_api_contacts.py -q`
+Expected: PASS — existing callers use the default content type, unchanged.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
-git add src/services/storage.py tests/integration/test_social_media_url.py
+git add src/services/storage.py
 git commit -m "feat(social): parameterize storage upload content type (default unchanged)"
 ```
 
@@ -873,7 +863,9 @@ git commit -m "feat(social): parameterize storage upload content type (default u
 - Modify: `src/utils.py` (append `resolve_social_public_media_url` + image constants)
 - Test: `tests/integration/test_social_media_url.py`
 
-- [ ] **Step 1: Write the failing tests** (append to `tests/integration/test_social_media_url.py`)
+- [ ] **Step 1: Write the failing tests** (create `tests/integration/test_social_media_url.py`)
+
+These two cover the user-required guarantees: Spaces URLs are never rewritten, and `LOCAL_MEDIA_BASE_URL` takes exclusive precedence over `PUBLIC_BASE_URL`.
 
 ```python
 from src.utils import resolve_social_public_media_url
@@ -897,23 +889,6 @@ def test_resolver_prefers_local_media_base_url_over_public(monkeypatch):
     monkeypatch.setattr(utils_module.settings, "PUBLIC_BASE_URL", "https://app.test")
     url = resolve_social_public_media_url("posts/x.jpg", None)
     assert url == "https://ngrok.test/storage/posts/x.jpg"
-
-
-def test_resolver_falls_back_to_public_base_url(monkeypatch):
-    import src.utils as utils_module
-
-    monkeypatch.setattr(utils_module.settings, "LOCAL_MEDIA_BASE_URL", "")
-    monkeypatch.setattr(utils_module.settings, "PUBLIC_BASE_URL", "https://app.test")
-    url = resolve_social_public_media_url("posts/x.jpg", None)
-    assert url == "https://app.test/storage/posts/x.jpg"
-
-
-def test_resolver_returns_none_when_no_base(monkeypatch):
-    import src.utils as utils_module
-
-    monkeypatch.setattr(utils_module.settings, "LOCAL_MEDIA_BASE_URL", "")
-    monkeypatch.setattr(utils_module.settings, "PUBLIC_BASE_URL", "")
-    assert resolve_social_public_media_url("posts/x.jpg", None) is None
 ```
 
 - [ ] **Step 2: Run — expect failure**
@@ -944,7 +919,7 @@ def resolve_social_public_media_url(
 - [ ] **Step 4: Run — expect pass**
 
 Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/pytest tests/integration/test_social_media_url.py -v`
-Expected: PASS (all 5 tests)
+Expected: PASS (2 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -1167,6 +1142,8 @@ git commit -m "feat(social): Meta Graph publish methods (FB+IG) and structured M
 
 Create `tests/integration/test_meta_error_mapping.py`:
 
+The expired-token classification is exercised end-to-end by the executor test; here we keep the three that isolate non-DB logic — rate-limit reset parsing, media-invalid subcode classification, and transient retryability.
+
 ```python
 import json
 from datetime import datetime, timezone
@@ -1176,13 +1153,6 @@ from src.integrations.meta_graph import MetaGraphError
 from src.services.meta_error_mapping import classify_meta_error
 
 NOW = datetime(2026, 6, 9, 12, 0, tzinfo=timezone.utc)
-
-
-def test_expired_token_is_not_retryable():
-    outcome = classify_meta_error(MetaGraphError("expired", code=190, error_subcode=463), NOW)
-    assert outcome.error_code == PublishErrorCode.EXPIRED_TOKEN.value
-    assert outcome.retryable is False
-    assert "reconnect" in outcome.message.lower()
 
 
 def test_rate_limit_is_retryable_with_reset_from_header():
@@ -1197,11 +1167,6 @@ def test_rate_limit_is_retryable_with_reset_from_header():
     assert outcome.reset_at == datetime(2026, 6, 9, 12, 30, tzinfo=timezone.utc)
 
 
-def test_rate_limit_without_header_defaults_one_hour():
-    outcome = classify_meta_error(MetaGraphError("limit", code=4), NOW)
-    assert outcome.reset_at == datetime(2026, 6, 9, 13, 0, tzinfo=timezone.utc)
-
-
 def test_media_invalid_by_subcode():
     outcome = classify_meta_error(
         MetaGraphError("bad image", code=100, error_subcode=2207006), NOW
@@ -1214,12 +1179,6 @@ def test_transient_5xx_is_retryable():
     outcome = classify_meta_error(MetaGraphError("oops", http_status=503), NOW)
     assert outcome.error_code == PublishErrorCode.TRANSIENT.value
     assert outcome.retryable is True
-
-
-def test_unknown_is_not_retryable():
-    outcome = classify_meta_error(MetaGraphError("weird", code=999), NOW)
-    assert outcome.error_code == PublishErrorCode.UNKNOWN.value
-    assert outcome.retryable is False
 ```
 
 - [ ] **Step 2: Run — expect failure**
@@ -1356,7 +1315,7 @@ def classify_meta_error(
 - [ ] **Step 4: Run — expect pass**
 
 Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/pytest tests/integration/test_meta_error_mapping.py -v`
-Expected: PASS (6 tests)
+Expected: PASS (3 tests)
 
 - [ ] **Step 5: Commit**
 
@@ -2317,7 +2276,7 @@ Add inside the `include_router` block:
 Create `tests/integration/test_api_posts.py`:
 
 ```python
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import pytest
 import pytest_asyncio
@@ -2357,14 +2316,6 @@ async def test_instagram_requires_media(posts_client, db_session):
 
 
 @pytest.mark.asyncio
-async def test_publish_requires_an_account(posts_client):
-    response = await posts_client.post(
-        "/api/posts/publish", json={"content": "hi", "media_ids": [], "account_ids": []}
-    )
-    assert response.status_code == 422
-
-
-@pytest.mark.asyncio
 async def test_unauthorized_account_returns_reconnect_400(posts_client, db_session):
     account = await seed_connected_account(db_session, AGENCY, MetaPlatform.FACEBOOK.value, "PAGE1", NOW)
     account.authorized = False
@@ -2375,23 +2326,12 @@ async def test_unauthorized_account_returns_reconnect_400(posts_client, db_sessi
     )
     assert response.status_code == 400
     assert response.json()["detail"]["error_code"] == "account_needs_reconnect"
-
-
-@pytest.mark.asyncio
-async def test_schedule_rejects_past_time(posts_client, db_session):
-    account = await seed_connected_account(db_session, AGENCY, MetaPlatform.FACEBOOK.value, "PAGE1", NOW)
-    past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
-    response = await posts_client.post(
-        "/api/posts/schedule",
-        json={"content": "hi", "media_ids": [], "account_ids": [str(account.id)], "scheduled_at": past},
-    )
-    assert response.status_code == 422
 ```
 
 - [ ] **Step 5: Run the endpoint tests — expect pass**
 
 Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/pytest tests/integration/test_api_posts.py -v`
-Expected: PASS (4 tests). The dev-mode `get_current_user` returns an owner system user, so `require_permission("posts:publish")` passes.
+Expected: PASS (2 tests). The dev-mode `get_current_user` returns an owner system user, so `require_permission("posts:publish")` passes.
 
 - [ ] **Step 6: Commit**
 
@@ -2451,30 +2391,6 @@ async def test_due_scheduled_post_is_published(db_session: AsyncSession):
 
     await db_session.refresh(post)
     assert post.status == PostStatus.PUBLISHED.value
-
-
-@pytest.mark.asyncio
-async def test_retry_due_target_is_retried(db_session: AsyncSession):
-    account = await seed_connected_account(db_session, AGENCY, MetaPlatform.FACEBOOK.value, "PAGE1", NOW)
-    post = Post(agency_id=AGENCY, content="x", status=PostStatus.PUBLISHING.value)
-    db_session.add(post)
-    await db_session.flush()
-    target = PostTarget(
-        post_id=post.id,
-        social_account_id=account.id,
-        platform=account.platform,
-        status=PostTargetStatus.RATE_LIMITED.value,
-        attempt_count=1,
-        next_attempt_at=NOW - timedelta(minutes=1),
-    )
-    db_session.add(target)
-    await db_session.flush()
-
-    graph = FakePublishGraphClient(post_id="FBPOST")
-    await SocialPostRunner(db_session, graph_client=graph).run_once(NOW)
-
-    await db_session.refresh(target)
-    assert target.status == PostTargetStatus.PUBLISHED.value
 ```
 
 - [ ] **Step 2: Run — expect failure**
@@ -2586,7 +2502,7 @@ async def social_post_poller_loop() -> None:
 - [ ] **Step 4: Run — expect pass**
 
 Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/pytest tests/integration/test_social_post_poller.py -v`
-Expected: PASS (2 tests)
+Expected: PASS (1 test)
 
 - [ ] **Step 5: Wire the loop into `src/main.py` lifespan**
 
