@@ -22,7 +22,7 @@ Two named endpoints:
 The feature must surface the failure modes that silently break social publishing:
 
 1. **Expired token** → actionable error prompting reconnect; never a silent failure.
-2. **Rate limit** (Instagram content-publishing limit, 25 posts / 24h) → clear error with time until reset.
+2. **Rate limit** (Instagram content-publishing limit — read live from the API; currently 100/24h per Meta, historically 25) → clear error with time until reset.
 3. **Media format/size rejection** → specific validation message.
 4. **Every publish attempt** (success and failure) logged with timestamp, platform, and error detail.
 
@@ -309,19 +309,21 @@ Add a `_post()` helper and upgrade `MetaGraphError` to carry `code`, `error_subc
 `http_status`, `fbtrace_id`, and response `headers` (parsed from Meta's `{"error":{…}}`
 envelope + `X-App-Usage` / `X-Business-Use-Case-Usage`).
 
-| Method | Graph call |
-| --- | --- |
-| `publish_facebook_text(page_id, tok, msg)` | `POST /{page_id}/feed` |
-| `publish_facebook_single_photo(page_id, tok, url, msg)` | `POST /{page_id}/photos` |
-| `publish_facebook_multi_photo(page_id, tok, urls, msg)` | N× `/photos {published:false}` → `/feed {attached_media:[…]}` |
-| `create_instagram_image_container(ig_id, tok, url, content)` | `POST /{ig_id}/media` |
-| `create_instagram_carousel(ig_id, tok, child_ids, content)` | child `/media {is_carousel_item:true}` → parent `/media {media_type:CAROUSEL, children:[…]}` |
-| `get_instagram_container_status(creation_id, tok)` | `GET /{creation_id}?fields=status_code` (poll → `FINISHED`) |
-| `publish_instagram_container(ig_id, tok, creation_id)` | `POST /{ig_id}/media_publish` |
-| `get_instagram_publishing_limit(ig_id, tok)` | `GET /{ig_id}/content_publishing_limit` (25/24h quota → reset computation) |
+| Method | Graph call | Meta docs |
+| --- | --- | --- |
+| `publish_facebook_text(page_id, tok, msg)` | `POST /{page_id}/feed` | [Page · Feed](https://developers.facebook.com/docs/graph-api/reference/page/feed/) |
+| `publish_facebook_single_photo(page_id, tok, url, msg)` | `POST /{page_id}/photos` | [Page · Photos](https://developers.facebook.com/docs/graph-api/reference/page/photos/) |
+| `publish_facebook_multi_photo(page_id, tok, urls, msg)` | N× `/photos {published:false}` → `/feed {attached_media:[…]}` | [Page · Photos](https://developers.facebook.com/docs/graph-api/reference/page/photos/) · [Page · Feed](https://developers.facebook.com/docs/graph-api/reference/page/feed/) |
+| `create_instagram_image_container(ig_id, tok, url, content)` | `POST /{ig_id}/media` | [IG User · Media](https://developers.facebook.com/docs/instagram-platform/instagram-graph-api/reference/ig-user/media/) |
+| `create_instagram_carousel(ig_id, tok, child_ids, content)` | child `/media {is_carousel_item:true}` → parent `/media {media_type:CAROUSEL, children:[…]}` | [Content Publishing · Carousel Posts](https://developers.facebook.com/docs/instagram-platform/content-publishing/) |
+| `get_instagram_container_status(creation_id, tok)` | `GET /{creation_id}?fields=status_code` (poll → `FINISHED`) | [IG Container](https://developers.facebook.com/docs/instagram-platform/instagram-graph-api/reference/ig-container/) |
+| `publish_instagram_container(ig_id, tok, creation_id)` | `POST /{ig_id}/media_publish` | [IG User · Media Publish](https://developers.facebook.com/docs/instagram-platform/instagram-graph-api/reference/ig-user/media_publish/) |
+| `get_instagram_publishing_limit(ig_id, tok)` | `GET /{ig_id}/content_publishing_limit` (per-account publishing quota → reset computation) | [IG User · Content Publishing Limit](https://developers.facebook.com/docs/instagram-platform/instagram-graph-api/reference/ig-user/content_publishing_limit/) |
 
 All calls go through the single `base_url` built from `META_GRAPH_VERSION`, so a Graph-version
 bump is one config change (see §13).
+
+**Cross-cutting Meta references:** [Instagram Content Publishing guide](https://developers.facebook.com/docs/instagram-platform/content-publishing/) · [Graph API error handling](https://developers.facebook.com/docs/graph-api/guides/error-handling/) · [Graph API rate limiting](https://developers.facebook.com/docs/graph-api/overview/rate-limiting/) (the `X-App-Usage` / `X-Business-Use-Case-Usage` headers) · [Pages API · Posts](https://developers.facebook.com/docs/pages-api/posts/).
 
 ## 9. Error mapping — `classify_meta_error()`
 
@@ -330,7 +332,7 @@ Returns `(error_code, retryable, reset_at, actionable_message)`. Meta codes kept
 | Meta signal | `error_code` | retryable | Target status | Actionable message |
 | --- | --- | --- | --- | --- |
 | code **190** (+sub 463/467/460/458), `OAuthException` | `expired_token` | **no** | `needs_reconnect` (also flips `account.authorized=False` + connection → `needs_reconnect`) | "Your {platform} connection has expired. Reconnect at Settings → Social to keep publishing." |
-| codes **4 / 17 / 32 / 613 / 80007** (IG content-publish limit) | `rate_limited` | **yes** | `rate_limited` | "Instagram limit reached (25 posts/24h). Next slot ~{reset, local}." — `reset_at` from `estimated_time_to_regain_access` header, else `content_publishing_limit`, else +1h |
+| codes **4 / 17 / 32 / 613 / 80007** (IG content-publish limit) | `rate_limited` | **yes** | `rate_limited` | "Instagram publishing limit reached ({quota}/24h). Next slot ~{reset, local}." — `{quota}` + `reset_at` read live from `content_publishing_limit`; `reset_at` also from the `estimated_time_to_regain_access` header, else +1h |
 | code **100** + media subcodes (2207003/04/06, 36xxx), 9004 | `media_invalid` | **no** | `failed` | Meta's specific reason → "Instagram rejected the image: aspect ratio out of range." |
 | codes **1 / 2**, HTTP 5xx | `transient` | yes | `failed` → retry | "Temporary {platform} error; retrying." |
 | anything else | `unknown` | **no** | `failed` + `needs_attention` | "Publishing failed: {meta message}." |
@@ -342,6 +344,12 @@ the storage layer, not just logs.
 > **Graph-version sunset hint:** a wholesale `META_GRAPH_VERSION` deprecation surfaces as
 > `unknown`/`transient` across *all* targets simultaneously — distinct from a per-account token
 > issue. Note this in runbooks so it isn't mistaken for a reconnect problem.
+
+> **Instagram publishing quota:** Meta's documented limit is **100 posts / 24h** (carousels
+> count as 1), enforced on `media_publish` — historically 25. The quota is **read live** per
+> account from `GET /{ig_id}/content_publishing_limit` (config fallback
+> `IG_CONTENT_PUBLISH_LIMIT_PER_24H = 100`); user-facing copy never hardcodes the number.
+> See [IG User · Content Publishing Limit](https://developers.facebook.com/docs/instagram-platform/instagram-graph-api/reference/ig-user/content_publishing_limit/).
 
 ## 10. Media: upload, validation, public-URL resolution
 
