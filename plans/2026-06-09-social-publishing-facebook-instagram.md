@@ -119,6 +119,7 @@ class PublishErrorCode(str, Enum):
 
 class MediaType(str, Enum):
     IMAGE = "image"
+    VIDEO = "video"
 
 
 META_OAUTH_ERROR_CODES = frozenset({190})
@@ -129,7 +130,20 @@ META_MEDIA_INVALID_ERROR_SUBCODES = frozenset(
     {2207003, 2207004, 2207006, 2207020, 2207026, 2207032}
 )
 META_TRANSIENT_ERROR_CODES = frozenset({1, 2})
+
+SOCIAL_FACEBOOK_IMAGE_TYPES = frozenset({"image/jpeg", "image/png", "image/gif"})
+SOCIAL_INSTAGRAM_IMAGE_TYPES = frozenset({"image/jpeg"})
+SOCIAL_VIDEO_TYPES = frozenset({"video/mp4", "video/quicktime"})
+SOCIAL_ALLOWED_IMAGE_TYPES = SOCIAL_FACEBOOK_IMAGE_TYPES | SOCIAL_INSTAGRAM_IMAGE_TYPES
+SOCIAL_ALLOWED_MEDIA_TYPES = SOCIAL_ALLOWED_IMAGE_TYPES | SOCIAL_VIDEO_TYPES
 ```
+
+> **Per-platform content types (verified vs Meta docs):** Instagram images are **JPEG-only**;
+> Facebook `/photos` also accepts PNG + GIF. Video types and `MediaType.VIDEO` are defined for
+> forthcoming work but the v1 executor is image-only and must **reject `media_type == video`** with
+> a clear "not yet supported" error. Enum-backed columns stay `String` (see spec §5.5); choices are
+> enforced at the app layer — `SOCIAL_ALLOWED_MEDIA_TYPES` at upload, `SOCIAL_INSTAGRAM_IMAGE_TYPES`
+> per-IG-target at publish. **Env note:** this checkout's virtualenv is `.venv/bin`, not `venv/bin`.
 
 - [ ] **Step 2: Verify it imports**
 
@@ -173,9 +187,10 @@ Add these lines to `class Settings` in `src/config.py`, immediately after `META_
 Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/python -c "from src.config import settings; print(settings.SOCIAL_POST_MAX_ATTEMPTS, settings.SOCIAL_MAX_IMAGE_BYTES, repr(settings.LOCAL_MEDIA_BASE_URL))"`
 Expected: `5 8388608 ''`
 
-- [ ] **Step 3: Add to `.env.template`**
+- [ ] **Step 3: Add to `.env.template` AND `.env.example`**
 
-Append to `.env.template` (so new tenants inherit it):
+Append this block to **both** `.env.template` (provisioner source for new tenants) and
+`.env.example` (developer reference) — new env vars must land in both:
 
 ```
 # Social publishing — local dev media tunnel (e.g. ngrok) so Instagram can fetch local images
@@ -439,12 +454,27 @@ git commit -m "feat(social): add Post, PostTarget, Media, PostPublishAttempt mod
 ## Task 4: Alembic migration
 
 **Files:**
-- Create: `alembic/versions/<auto>_add_social_posts.py` (scaffolded by alembic)
+- Create: `alembic/versions/<auto>_add_social_posts.py`
 
-- [ ] **Step 1: Scaffold the migration (auto-fills revision + down_revision)**
+> **Two pre-existing heads + one-file decision (as built):** the branch had two alembic heads
+> (`c3d4e5f6a7b8` and `dev201_prop_area_naming`). Rather than a separate merge revision, the
+> social migration is authored as a **single file** that is itself a mergepoint —
+> `down_revision = ('c3d4e5f6a7b8', 'dev201_prop_area_naming')` — and creates all 4 tables. Tradeoff:
+> `alembic downgrade -1` is **ambiguous** on a mergepoint; roll back with an explicit target instead
+> (`alembic downgrade dev201_prop_area_naming`). Regular `upgrade head` is unaffected.
+>
+> **Env (as built):** virtualenv is `.venv/bin`; the dev DB is the docker container
+> `slicify-realestate-postgres` (`sideline_realestate`, creds `slicify:slicify`, port 5432). Point
+> alembic at it with `ALEMBIC_DB_URL="postgresql+psycopg2://slicify:slicify@127.0.0.1:5432/sideline_realestate"`
+> (the host root `.env` carries stale `ab5` creds). The dev DB had create_all drift (schema ahead of
+> pointer), so it was **reset** (drop + recreate + `upgrade head` from base) to align pointer & schema.
 
-Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/alembic revision -m "add_social_posts"`
-Expected: prints `Generating .../alembic/versions/<id>_add_social_posts.py ... done`. Open that file. Leave the auto-generated `revision` and `down_revision` lines untouched.
+- [ ] **Step 1: Author the single migration file (mergepoint)**
+
+Because two heads exist, `alembic revision` errors ("Multiple heads"). Hand-author
+`alembic/versions/9dfc248310c8_add_social_posts.py` with
+`revision = '9dfc248310c8'` and `down_revision = ('c3d4e5f6a7b8', 'dev201_prop_area_naming')`.
+Confirm a single head: `.venv/bin/alembic heads` → `9dfc248310c8 (head)`.
 
 - [ ] **Step 2: Fill `upgrade()` and `downgrade()`**
 
@@ -898,8 +928,12 @@ Expected: FAIL — `ImportError: cannot import name 'resolve_social_public_media
 
 - [ ] **Step 3: Implement in `src/utils.py`** (append at end of file)
 
+> The image content-type sets now live in `src/constants.py` (`SOCIAL_ALLOWED_IMAGE_TYPES`,
+> `SOCIAL_INSTAGRAM_IMAGE_TYPES`, etc., added in Task 1). **Do not redefine them here** — import
+> from `src.constants` where needed. Only the IG aspect-ratio thresholds (validation math) stay in
+> `utils.py`.
+
 ```python
-SOCIAL_ALLOWED_IMAGE_TYPES = frozenset({"image/jpeg", "image/png"})
 SOCIAL_IG_MIN_ASPECT_RATIO = 0.8
 SOCIAL_IG_MAX_ASPECT_RATIO = 1.91
 
@@ -1427,6 +1461,19 @@ This is the core. It validates a publish request, builds the post + targets + me
 - Modify: `tests/fakes/meta_graph.py`, `tests/factories/social.py`
 - Test: `tests/integration/test_social_publish_service.py`
 
+> **Test factories use `factory_boy` (as built).** Install with `.venv/bin/pip install factory_boy`
+> (pulls in `Faker`). Because the session is `AsyncSession`, factory_boy's sync persistence is **not**
+> used — define `factory.Factory` classes and call `.build(**overrides)` only, then `session.add` +
+> `await session.flush()` explicitly. Test deps aren't pinned in `requirements.txt` here (neither is
+> pytest), so factory_boy isn't added there either.
+>
+> **Service relationship-loading fix (as built):** `publish_post` starts with
+> `await self.session.refresh(post, attribute_names=["targets", "media"])`. The service reads
+> `post.targets`/`post.media` (selectin), but a freshly-built post lazy-loads them → `MissingGreenlet`
+> under async; the async refresh eager-loads them for every caller. Also: account↔connection wiring in
+> the factory sets `connection_id=connection.id` directly (not `connection.accounts.append`, which
+> lazy-loads a persistent collection and throws `MissingGreenlet`).
+
 - [ ] **Step 1: Add a publishing fake graph client** — append to `tests/fakes/meta_graph.py`:
 
 ```python
@@ -1472,9 +1519,39 @@ class FakePublishGraphClient:
         return self._post_id
 ```
 
-- [ ] **Step 2: Add an account factory** — append to `tests/factories/social.py`:
+- [ ] **Step 2: Define `factory_boy` factories + the account factory** in `tests/factories/social.py`.
+
+Define build-only `factory.Factory` classes and persist via the async session in the seed helpers
+(`seed_agency` is also migrated to these factories, keeping its deterministic `token_expires_at` /
+`warning_level=0` / `status=CONNECTED` so the monitor token tests stay behaviorally identical):
 
 ```python
+import factory
+from sqlalchemy import select
+
+
+class AgencySocialConnectionFactory(factory.Factory):
+    class Meta:
+        model = AgencySocialConnection
+
+    agency_id = "default"
+    user_access_token = factory.LazyFunction(lambda: encrypt("user-token"))
+    status = MetaConnectionStatus.CONNECTED.value
+    warning_level = 0
+
+
+class AgencySocialAccountFactory(factory.Factory):
+    class Meta:
+        model = AgencySocialAccount
+
+    agency_id = "default"
+    platform = MetaPlatform.FACEBOOK.value
+    provider_id = "PAGE1"
+    access_token = factory.LazyFunction(lambda: encrypt("page-token"))
+    is_primary = True
+    authorized = True
+
+
 async def seed_connected_account(
     session: AsyncSession,
     agency_id: str,
@@ -1483,15 +1560,14 @@ async def seed_connected_account(
     now: datetime,
 ) -> AgencySocialAccount:
     connection = await _get_or_create_connection(session, agency_id, now)
-    account = AgencySocialAccount(
+    account = AgencySocialAccountFactory.build(
         agency_id=agency_id,
         platform=platform,
         provider_id=provider_id,
-        access_token=encrypt("page-token"),
         is_primary=platform == MetaPlatform.FACEBOOK.value,
-        authorized=True,
+        connection_id=connection.id,
     )
-    connection.accounts.append(account)
+    session.add(account)
     await session.flush()
     await session.refresh(account)
     return account
@@ -1500,8 +1576,6 @@ async def seed_connected_account(
 async def _get_or_create_connection(
     session: AsyncSession, agency_id: str, now: datetime
 ) -> AgencySocialConnection:
-    from sqlalchemy import select
-
     existing = await session.scalar(
         select(AgencySocialConnection).where(
             AgencySocialConnection.agency_id == agency_id
@@ -1509,12 +1583,9 @@ async def _get_or_create_connection(
     )
     if existing:
         return existing
-    connection = AgencySocialConnection(
+    connection = AgencySocialConnectionFactory.build(
         agency_id=agency_id,
-        user_access_token=encrypt("user-token"),
         token_expires_at=now + timedelta(days=40),
-        status=MetaConnectionStatus.CONNECTED.value,
-        warning_level=0,
     )
     session.add(connection)
     await session.flush()
@@ -1969,6 +2040,21 @@ git commit -m "feat(social): add posts:publish permission to owner/admin/agent"
 
 The router exposes the 6 endpoints. Validation lives in the service. Build in two commits: (13a) the service create/validate methods + media upload, (13b) the router + endpoint tests.
 
+> **Implementation notes (applied during execution):**
+> - `SOCIAL_ALLOWED_IMAGE_TYPES` lives in `src/constants.py` (moved there in Task 1), not `src/utils`. All imports of it come from `src.constants`.
+> - Per the app-layer per-platform decision, Instagram media is validated against `SOCIAL_INSTAGRAM_IMAGE_TYPES` (JPEG-only) — PNG/GIF that Facebook accepts are rejected for IG. The IG content-type error reads "must be JPEG for Instagram."
+> - The upload gate accepts `SOCIAL_ALLOWED_IMAGE_TYPES` (JPEG/PNG/GIF); `EXT_BY_TYPE` includes `image/gif → .gif` to match.
+> - Per backend rules, all imports are hoisted to the top of `social_publish_service.py` (no inline imports); validation was split into small helpers (`_reconnect_detail`, `_validate_instagram_item`) using the module-level aspect-ratio constants instead of passing them as args.
+> - `_build_post` / `create_scheduled` refresh `["targets", "media"]` so `PostResponse` serializes without a lazy-load `MissingGreenlet`.
+> **Post-Task-13 architecture refactor (final state — applied incrementally, grounded in FastAPI/Clean-Arch repo conventions):**
+> - **Domain validation extracted to its own class** in a new top-level **`src/validators/`** package (sibling of `src/schemas/`: schemas = request-shape validation, validators = domain validation). Class `SocialPostValidator` lives in `src/validators/social_post.py` (file drops the redundant `_validator` suffix since the package conveys it; scales to `validators/listing.py`, `validators/contact.py`, …). Constructor-injected into `SocialPublishService.__init__` as `self.validator = SocialPostValidator(self.accounts, self.media)`.
+> - The validator owns **all** domain validation: `validate_accounts`, `validate_media` (+ `_validate_caption`, `_validate_instagram_media`, `_validate_instagram_item`, `_reconnect_detail`), `validate_scheduled_at`, and `validate_upload` (content-type/empty/size) + the `IG_CAPTION_MAX` (2200) / `FB_CAPTION_MAX` (63206) constants. Caption length is enforced for both platforms.
+> - Validation is invoked **by the service, never by the router or a FastAPI dependency** — pushing it to request scope would break reuse by the non-HTTP scheduled poller / future CLI. Pydantic schemas (`PostPublishRequest`/`PostScheduleRequest`) remain the request-layer (shape) validation; the split is deliberate.
+> - **Router kept thin:** `src/api/posts.py` does Pydantic + auth + delegation only. The media-upload flow (`store_media_uploads` → `_store_one` → `_dimensions` → `_persist_media`) and the `EXT_BY_TYPE` storage-key map live in the **service**; `_dimensions` raises `SocialPublishValidationError(422, "Not a valid image.")` instead of `HTTPException` (services never raise HTTP errors). The endpoint catches `SocialPublishValidationError` → `HTTPException`.
+> - A shared **`utc_now()`** helper was added to `src/utils.py` (replacing a local `_now()` in the router); `datetime.now(timezone.utc)` recurs in ~49 files.
+> - **Unit test added:** `tests/unit/test_social_post_validator.py` — 27 cases over every validator branch using `AsyncMock` repos + `SimpleNamespace` stubs (no DB).
+> - Commit step (Step 6) skipped — no-auto-commit.
+
 **Files:**
 - Modify: `src/services/social_publish_service.py` (add request handling), `src/main.py`
 - Create: `src/api/posts.py`
@@ -2348,8 +2434,13 @@ git commit -m "feat(social): posts API (publish, schedule, media upload, list, d
 
 **Files:**
 - Create: `src/services/social_post_poller.py`
-- Modify: `src/main.py`
+- Modify: `src/main.py`, `src/services/social_publish_service.py`
 - Test: `tests/integration/test_social_post_poller.py`
+
+> **Implementation notes (applied during execution):**
+> - Instead of the poller reaching into the service's private `_media_urls` / `_recompute_post_status` (encapsulation break — same principle behind the PostValidator extraction), added a public `SocialPublishService.retry_target(target, post, now)` that refreshes `["targets","media"]`, resolves simulation mode, publishes the one target, and recomputes post status. `_retry_due_targets` calls `self.service.retry_target(...)`.
+> - The plan's `_simulation_enabled` poller helper was dropped — `retry_target` resolves simulation internally, so the helper became dead code.
+> - Commit step (Step 7) skipped — no-auto-commit.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2544,13 +2635,176 @@ git commit -m "feat(social): scheduled-post poller with retry + orphan sweep, wi
 
 - [ ] **Step 1: Run the whole new test surface**
 
-Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/pytest tests/integration/test_social_media_url.py tests/integration/test_meta_error_mapping.py tests/integration/test_social_publish_service.py tests/integration/test_social_post_poller.py tests/integration/test_api_posts.py tests/integration/test_meta_token_monitor.py -v`
-Expected: all PASS, no errors.
+Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/pytest tests/unit/test_social_post_validator.py tests/integration/test_social_media_url.py tests/integration/test_meta_error_mapping.py tests/integration/test_social_publish_service.py tests/integration/test_social_post_poller.py tests/integration/test_api_posts.py tests/integration/test_meta_token_monitor.py -v`
+Expected: all PASS, no errors. (`test_social_post_validator.py` is a pure unit test — `AsyncMock` repos, no DB, runs without env vars.)
 
 - [ ] **Step 2: Run the full test suite to confirm no regressions**
 
 Run: `cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate" && venv/bin/pytest -q`
 Expected: the suite passes (or only pre-existing unrelated failures — compare against `git stash` baseline if unsure).
+
+### Manual testing by hand (each API + the scheduler)
+
+> Goal: exercise all 6 endpoints and the scheduled poller against the local default dev DB (`sideline_realestate` on the docker postgres) **without** real Meta credentials, by running in **simulation mode**.
+
+**Gotchas this prep handles (don't skip it):**
+1. `Post.created_by_user_id` is a **FK → `users.id`**. Dev-mode auth injects the all-zeros system user (`00000000-0000-0000-0000-000000000000`); that row must exist or `POST /publish` and `/schedule` fail with a FK violation. (The automated tests never hit this — they fail at validation before the insert.)
+2. Sends require either real Meta tokens or **simulation mode** (`app_settings.messaging.simulation_mode = "true"`), which makes the executor log a `sim_…` id instead of calling Graph. The prep turns it on.
+
+Dev auth needs **both** `API_KEY` and `JWT_SECRET_KEY` unset (then no token/header is required). If your env sets either, add `-H "X-API-Key: <key>" -H "X-Tenant: default"` to every curl.
+
+> **Resetting the local DB — avoid the slow path.** `make local-db-reset` first rebuilds the whole backend Docker image (its `local-build` prerequisite runs `pip install` + `playwright install --with-deps chromium` — Chromium + ~95 apt packages off a slow arm64 mirror = 10–70 min). The reset itself is seconds. The Docker Postgres is already running, so reset + reseed directly via `.venv` instead:
+> ```bash
+> export DB_USER=slicify DB_PASSWORD=slicify DB_HOST=127.0.0.1 DB_PORT=5432
+> export ALEMBIC_DB_URL="postgresql://slicify:slicify@127.0.0.1:5432/sideline_realestate"
+> .venv/bin/alembic upgrade head && .venv/bin/python -m src.seed --reset   # truncate all + reseed (17 seeds)
+> ```
+> **Caveat:** `make local-db-reset`'s `local-env` prerequisite **regenerates `.env.local` and drops the manually-added `TOKEN_ENCRYPTION_KEY`** (it's not in the template). If you ran the `make` target (even partially), re-add a Fernet key to `.env.local` or the prep's `encrypt()` calls raise: `TOKEN_ENCRYPTION_KEY=$(.venv/bin/python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')`. Safe on a freshly-reset DB (no encrypted rows yet).
+
+- [ ] **M1: Start the server (poller auto-starts, 60s interval)**
+
+```bash
+cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate"
+export $(grep -E "^TOKEN_ENCRYPTION_KEY=" .env.local | xargs)
+DB_USER=slicify DB_PASSWORD=slicify DB_HOST=127.0.0.1 DB_PORT=5432 \
+  .venv/bin/uvicorn src.main:app --reload --port 55800
+```
+
+Watch for `social_post_poller.started interval=60` in the logs — confirms Task 14 wiring.
+
+- [ ] **M2: One-time prep — seed system user + a connected FB & IG account + sim mode** (run in a second shell, same env)
+
+```bash
+cd "/Users/binhquach/Workplace/Slicify AI/slicify-realestate"
+export $(grep -E "^TOKEN_ENCRYPTION_KEY=" .env.local | xargs)
+DB_USER=slicify DB_PASSWORD=slicify DB_HOST=127.0.0.1 DB_PORT=5432 \
+  .venv/bin/python - <<'PY'
+import asyncio, uuid
+from datetime import datetime, timedelta, timezone
+from src.db.session import async_session_factory
+from src.models.user import User
+from src.models.agency_social_connection import AgencySocialConnection
+from src.models.agency_social_account import AgencySocialAccount
+from src.db.repositories.app_setting import AppSettingRepository
+from src.constants import MetaPlatform, MetaConnectionStatus
+from src.utils import encrypt
+
+SYS = uuid.UUID("00000000-0000-0000-0000-000000000000")
+AGENCY = "default"
+
+async def main():
+    async with async_session_factory() as s:
+        if not await s.get(User, SYS):
+            s.add(User(id=SYS, email="dev@slicify.co.nz", username="dev",
+                       first_name="Dev", last_name="User", role="owner", is_active=True))
+        conn = AgencySocialConnection(
+            agency_id=AGENCY, user_access_token=encrypt("sim-user-token"),
+            status=MetaConnectionStatus.CONNECTED.value, warning_level=0,
+            token_expires_at=datetime.now(timezone.utc) + timedelta(days=40))
+        s.add(conn); await s.flush()
+        fb = AgencySocialAccount(agency_id=AGENCY, platform=MetaPlatform.FACEBOOK.value,
+            provider_id="PAGE_TEST", name="Test Page", access_token=encrypt("sim-token"),
+            is_primary=True, authorized=True, connection_id=conn.id)
+        ig = AgencySocialAccount(agency_id=AGENCY, platform=MetaPlatform.INSTAGRAM.value,
+            provider_id="IG_TEST", name="Test IG", access_token=encrypt("sim-token"),
+            is_primary=False, authorized=True, connection_id=conn.id)
+        s.add_all([fb, ig]); await s.flush()
+        await AppSettingRepository(s).set_value("messaging.simulation_mode", "true")
+        await s.commit()
+        print("FB_ACCOUNT_ID =", fb.id)
+        print("IG_ACCOUNT_ID =", ig.id)
+
+asyncio.run(main())
+PY
+```
+
+Run **once** (re-running adds duplicate accounts). Copy the printed `FB_ACCOUNT_ID` / `IG_ACCOUNT_ID`.
+
+- [ ] **M3: Upload media (endpoint 1)** — `POST /api/posts/media`. **Note:** each media row attaches to exactly one post, so upload a fresh image for every publish/schedule below (re-using a `media_id` returns 422 "already attached").
+
+```bash
+BASE=http://127.0.0.1:55800
+curl -s -X POST $BASE/api/posts/media -F "files=@$HOME/Downloads/photo.jpg" | jq
+# -> [{"id":"<MEDIA_ID>","content_type":"image/jpeg",...}]  (201)
+```
+
+- [ ] **M4: Publish now to Facebook (endpoint 2)** — expect `200`, `status: "published"`, a `sim_…` `provider_post_id` on the target.
+
+```bash
+curl -s -X POST $BASE/api/posts/publish -H 'Content-Type: application/json' \
+  -d '{"content":"Hello FB","media_ids":["<MEDIA_ID>"],"account_ids":["<FB_ACCOUNT_ID>"]}' | jq
+```
+
+- [ ] **M5: Validation paths (still endpoint 2)**
+  - IG with no media → **422** "Instagram requires at least one image":
+    ```bash
+    curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/api/posts/publish \
+      -H 'Content-Type: application/json' \
+      -d '{"content":"hi","media_ids":[],"account_ids":["<IG_ACCOUNT_ID>"]}'   # 422
+    ```
+  - IG with a **PNG** → **422** `media_invalid` (IG is JPEG-only):
+    ```bash
+    PNG=$(curl -s -X POST $BASE/api/posts/media -F "files=@$HOME/Downloads/photo.png" | jq -r '.[0].id')
+    curl -s -X POST $BASE/api/posts/publish -H 'Content-Type: application/json' \
+      -d "{\"media_ids\":[\"$PNG\"],\"account_ids\":[\"<IG_ACCOUNT_ID>\"]}" | jq
+    ```
+  - Reconnect path → **400** `account_needs_reconnect`. Flip the FB account unauthorized (PGPASSWORD=slicify), then publish:
+    ```bash
+    PGPASSWORD=slicify psql -h 127.0.0.1 -U slicify -d sideline_realestate \
+      -c "UPDATE agency_social_accounts SET authorized=false WHERE id='<FB_ACCOUNT_ID>';"
+    curl -s -X POST $BASE/api/posts/publish -H 'Content-Type: application/json' \
+      -d '{"media_ids":[],"account_ids":["<FB_ACCOUNT_ID>"]}' | jq '.detail.error_code'   # "account_needs_reconnect"
+    # restore:
+    PGPASSWORD=slicify psql -h 127.0.0.1 -U slicify -d sideline_realestate \
+      -c "UPDATE agency_social_accounts SET authorized=true WHERE id='<FB_ACCOUNT_ID>';"
+    ```
+
+- [ ] **M6: Schedule (endpoint 3)** — `202`, `status: "scheduled"`. Upload a fresh image first; `scheduled_at` must be in the future (UTC ISO-8601).
+
+```bash
+M2=$(curl -s -X POST $BASE/api/posts/media -F "files=@$HOME/Downloads/photo.jpg" | jq -r '.[0].id')
+curl -s -X POST $BASE/api/posts/schedule -H 'Content-Type: application/json' \
+  -d "{\"content\":\"Later\",\"media_ids\":[\"$M2\"],\"account_ids\":[\"<FB_ACCOUNT_ID>\"],\"scheduled_at\":\"2026-06-10T23:59:00Z\"}" | jq
+# -> capture "id" as <SCHEDULED_ID>
+```
+
+- [ ] **M7: List + detail (endpoints 4 & 5)**
+
+```bash
+curl -s "$BASE/api/posts?limit=10" | jq '.[].status'
+curl -s $BASE/api/posts/<SCHEDULED_ID> | jq '{status, scheduled_at, targets: [.targets[].status]}'
+```
+
+- [ ] **M8: Cancel (endpoint 6)** — `204` for a scheduled post; re-GET shows `cancelled`. Cancelling a non-scheduled post → `409`.
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" -X DELETE $BASE/api/posts/<SCHEDULED_ID>   # 204
+curl -s $BASE/api/posts/<SCHEDULED_ID> | jq '.status'                               # "cancelled"
+```
+
+- [ ] **M9: Scheduler — instant trigger (no waiting)**. Create a fresh scheduled post with a **past** `scheduled_at`, then run one poller pass by hand and confirm it flips to `published`:
+
+```bash
+DB_USER=slicify DB_PASSWORD=slicify DB_HOST=127.0.0.1 DB_PORT=5432 \
+  .venv/bin/python - <<'PY'
+import asyncio
+from datetime import datetime, timezone
+from src.db.session import async_session_factory
+from src.services.social_post_poller import SocialPostRunner
+
+async def main():
+    async with async_session_factory() as s:
+        await SocialPostRunner(s).run_once(datetime.now(timezone.utc))
+        await s.commit()
+
+asyncio.run(main())
+PY
+curl -s $BASE/api/posts/<DUE_SCHEDULED_ID> | jq '.status'   # "published"
+```
+
+(`run_once` is safe in sim mode — the executor short-circuits before any Graph call.)
+
+- [ ] **M10: Scheduler — live loop (verifies Task 14 wiring)**. Schedule a post for ~70s in the future, leave the server running, and watch the post flip to `published` within one poll interval (logs show the poller pass). Confirms `social_post_poller_loop` is actually firing in the lifespan.
 
 - [ ] **Step 3: Document the deploy rollout in the PR description**
 

@@ -137,19 +137,19 @@ One model per file under `src/models/`. No secrets stored here (tokens already l
 
 ### 5.3 `Media` — `media` (uploaded images, shared across targets)
 
-| field | type | notes |
-| --- | --- | --- |
-| `id` | UUID PK | |
-| `post_id` | UUID FK→posts CASCADE, **nullable** | NULL while uploaded-but-unattached; set on publish/schedule |
-| `agency_id` | str(100), indexed | scope key (set at upload) |
-| `storage_key` | str(500) | key returned by the storage service |
-| `public_url` | str(1000), nullable | absolute URL (Spaces returns it at upload; local built at publish) |
-| `media_type` | str(20) | `image` (v1; `video` reserved) |
-| `content_type` | str(100) | `image/jpeg` \| `image/png` |
-| `width` / `height` | int, nullable | for IG aspect-ratio validation |
-| `byte_size` | int | |
-| `position` | smallint, default 0 | carousel ordering |
-| `created_at` / `updated_at` | timestamps | |
+| field                       | type                                | notes                                                              |
+| --------------------------- | ----------------------------------- | ------------------------------------------------------------------ |
+| `id`                        | UUID PK                             |                                                                    |
+| `post_id`                   | UUID FK→posts CASCADE, **nullable** | NULL while uploaded-but-unattached; set on publish/schedule        |
+| `agency_id`                 | str(100), indexed                   | scope key (set at upload)                                          |
+| `storage_key`               | str(500)                            | key returned by the storage service                                |
+| `public_url`                | str(1000), nullable                 | absolute URL (Spaces returns it at upload; local built at publish) |
+| `media_type`                | str(20)                             | `image` (v1 executor); `video` defined in constants but not yet publishable — rejected at publish |
+| `content_type`              | str(100)                            | per-platform, FB ⊇ IG: FB `image/jpeg`\|`image/png`\|`image/gif`, IG `image/jpeg` only; video `video/mp4`\|`video/quicktime` reserved |
+| `width` / `height`          | int, nullable                       | for IG aspect-ratio validation                                     |
+| `byte_size`                 | int                                 |                                                                    |
+| `position`                  | smallint, default 0                 | carousel ordering                                                  |
+| `created_at` / `updated_at` | timestamps                          |                                                                    |
 
 - 1 media = single image · 2–10 = carousel · 0 = Facebook text-only (IG targets rejected at validation).
 - Orphaned rows (`post_id IS NULL` older than `ORPHAN_TTL`) are swept by the poller (row + storage file deleted).
@@ -201,10 +201,37 @@ class PublishErrorCode(str, Enum):
     MEDIA_INVALID = "media_invalid"
     TRANSIENT = "transient"
     UNKNOWN = "unknown"
+
+class MediaType(str, Enum):
+    IMAGE = "image"
+    VIDEO = "video"
+
+SOCIAL_FACEBOOK_IMAGE_TYPES = frozenset({"image/jpeg", "image/png", "image/gif"})
+SOCIAL_INSTAGRAM_IMAGE_TYPES = frozenset({"image/jpeg"})
+SOCIAL_VIDEO_TYPES = frozenset({"video/mp4", "video/quicktime"})
+SOCIAL_ALLOWED_IMAGE_TYPES = SOCIAL_FACEBOOK_IMAGE_TYPES | SOCIAL_INSTAGRAM_IMAGE_TYPES
+SOCIAL_ALLOWED_MEDIA_TYPES = SOCIAL_ALLOWED_IMAGE_TYPES | SOCIAL_VIDEO_TYPES
 ```
 
 Reuse existing `MetaPlatform` (`facebook` | `instagram`). Meta numeric error codes/subcodes
 are kept as named constants (e.g. `META_ERROR_OAUTH = 190`, `IG_ERROR_CONTENT_PUBLISH_LIMIT = 80007`).
+
+**Column-type convention (decision):** enum-backed columns (`platform`, `status`, `media_type`,
+`content_type`) are stored as `String`, **not** Postgres native enums — consistent with the entire
+codebase (incl. sibling `agency_social_accounts.platform`). Native enums were rejected because the
+status sets churn (this feature adds several), `ALTER TYPE … ADD VALUE` is non-transactional and
+must fan out across every tenant DB + `slate_template`, Alembic doesn't autogenerate enum-value
+changes, and ORM member/value coercion is a footgun in the executor's platform/status branching.
+Choices are enforced at the **app layer**: Pydantic request/response fields are typed to the enums
+(`platform: MetaPlatform`, `media_type: MediaType`), and `content_type` is validated against the
+sets above — `SOCIAL_ALLOWED_MEDIA_TYPES` at upload time, then **per-platform** at publish/target
+time (an Instagram target rejects anything outside `SOCIAL_INSTAGRAM_IMAGE_TYPES`, so PNG/GIF that
+Facebook accepts are blocked for IG).
+
+**Per-platform formats (verified against Meta docs):** Instagram images are JPEG-only; Facebook
+Page `/photos` also accepts PNG and GIF. Video (`video/mp4`, `video/quicktime`) and `MediaType.VIDEO`
+are defined for forthcoming work but **not publishable in v1** — the image-only executor rejects
+`media_type == video` with a clear "not yet supported" error so the constants aren't dead code.
 
 ## 6. API endpoints
 
@@ -252,7 +279,7 @@ This is where two of the three required error scenarios are enforced *before* a 
    `422 "Instagram requires at least one image."`
 3. **Caption limits (per selected platform)** — IG selected & `len(content) > 2200` → `422`;
    Facebook cap `63 206`.
-4. **Image constraints for IG targets** — content-type ∈ {jpeg, png}, `byte_size ≤ SOCIAL_MAX_IMAGE_BYTES`,
+4. **Image constraints for IG targets** — content-type ∈ `SOCIAL_INSTAGRAM_IMAGE_TYPES` (**JPEG only**; PNG/GIF rejected for IG even though Facebook accepts them), `byte_size ≤ SOCIAL_MAX_IMAGE_BYTES`,
    aspect ratio ∈ [4:5 … 1.91:1] (from stored `width/height`) → else **`422`**
    `{error_code:"media_invalid", message:"Image 2 aspect ratio 2.3:1 exceeds Instagram's 1.91:1 maximum.", media_index:2}`.
    ⇐ *media-rejection requirement, specific message.*
@@ -358,7 +385,7 @@ the storage layer, not just logs.
 `SpacesStorageService.upload_file(content, key, content_type="application/pdf")` — content-type
 becomes an **optional** param defaulting to the current value, so every existing Spaces caller
 (document/PDF generation, Annature) behaves byte-identically. Only the new image upload passes
-`content_type="image/jpeg"` / `"image/png"`.
+the uploaded image's own content type (e.g. `image/jpeg`, `image/png`, `image/gif`).
 
 ### 10.2 Public-URL resolution (social-only resolver)
 
