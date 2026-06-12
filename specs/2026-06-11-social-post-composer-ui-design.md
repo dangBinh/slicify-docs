@@ -325,3 +325,112 @@ Manual smoke checks (because the rule "type checking and test suites verify code
 - Confirm whether a date library (Luxon / date-fns) is already in use for TZ conversion; if not, prefer `Intl.DateTimeFormat` + manual offset compute over adding a dependency.
 - Confirm the Lucide icon used for the Automation sidebar group so the Social Media entry matches visually.
 - Verify the exact field names in `src/schemas/posts.py` before finalising `frontend/src/types/posts.ts`.
+
+---
+
+## 16. Revisions after initial build
+
+These deltas were introduced during/after the first end-to-end build and supersede earlier sections where they overlap.
+
+### 16.1 Account health gating (supersedes §4)
+
+`PlatformHealth` gains a fourth value `"disabled"` (now `"connected" | "unhealthy" | "disconnected" | "disabled"`).
+
+Health derivation in `SocialPostsPage.derivePlatformHealth`:
+
+1. No connection → `disconnected`.
+2. No account of that platform → `disconnected`.
+3. **Instagram only**: account exists but none has `is_primary=true` → `disabled`. Tooltip: "No primary Instagram account — set one in Accounts." (Facebook is exempt — its sync always marks the first page primary.)
+4. Selected account not `authorized` → `unhealthy`.
+5. Else → `connected`.
+
+`ChannelChip` greys out for any non-`connected` value. `validateCompose` rejects publishing to any non-`connected` selection.
+
+### 16.2 Form state — useForm hook (supersedes §6)
+
+`ComposeTab` does not use raw `useState` for the form. It uses a reusable `useForm<TValues, TField>` hook (`frontend/src/hooks/useForm.ts`) built on React 19 features (`useActionState`) that tracks:
+
+- per-field `dirtyFields` and `touchedFields`
+- `isSubmitAttempted` (set when the publish/schedule button is clicked)
+- derived flags: `isDirty`, `isValid`, `isSubmitting`
+- `errors`, `submitError`, `getFieldErrors(field)`, `shouldShowFieldErrors(field)`
+
+Field error visibility rule: a field's errors render only when `isSubmitAttempted || (dirtyFields[field] && touchedFields[field])`. The whole-form `isDirty` does **not** unlock other fields' errors.
+
+A new `<FieldErrors messages={[...]}/>` component (`frontend/src/components/common/FieldErrors.tsx`) renders one red `<li>` per message inline beneath each input.
+
+When `noPlatformsConnected` is true, `ComposeTab` receives `disabled` from `SocialPostsPage` and suppresses all field error messages (the form is rendered but greyed out — see §16.4).
+
+### 16.3 Validation rules (supersedes §8)
+
+**Caption** (changed): caption is **required** — empty caption fails with "Write a caption." The earlier "caption OR image" rule was dropped.
+
+**Media** (expanded — frontend now mirrors backend, errors not warnings):
+
+- Type allow-list: image MIME must be one of `image/jpeg`, `image/png`, `image/gif`; otherwise "Image must be JPEG, PNG, or GIF."
+- Instagram MIME: if IG is selected, MIME must be `image/jpeg` exactly. Otherwise "Instagram only accepts JPEG. Convert the image before publishing."
+- Instagram aspect ratio: `width/height` must be in `[0.8, 1.91]`. Outside is an **error** (not a warning) — "Image aspect ratio X.XX:1 is taller/wider than Instagram's 4:5 / 1.91:1 limit. Crop or swap before publishing."
+- Image size: hard cap of **8 MB** (matches backend `SOCIAL_MAX_IMAGE_BYTES`). The dropzone also rejects files above this at selection time.
+
+Tests live in `frontend/src/lib/socialPostValidation.test.ts` (15 cases).
+
+### 16.4 Disabled-state when no platforms connected (new behavior)
+
+When `noPlatformsConnected` (both `health.facebook !== "connected"` and `health.instagram !== "connected"`):
+
+- `AccountsConnectBanner` is shown at the top with link `/integrations?tab=meta`.
+- `ComposeTab` receives `disabled={true}` and propagates it to `CaptionField` (tiptap `editable=false`, greyed styling) and `MediaDropZone` (browse/drop/remove all no-op, greyed styling).
+- Chips already grey via their non-`connected` health.
+- Publish/Schedule buttons disable via `canPublish = !disabled && form.isValid`.
+- All field error messages are suppressed in this state.
+
+### 16.5 MediaDropZone — selection-only, deferred upload (supersedes §10)
+
+`MediaDropZone` no longer has an `uploadFn` prop, internal `state`, or `errorMessage` prop. It's a pure file selector:
+
+- On file selection: creates a `SelectedMediaFile` (`{ file, previewUrl, kind, width, height, sizeBytes }`) via `URL.createObjectURL` + an `Image()` decode for dimensions. `readImageDimensionsSafe` resolves to `null` on decode error rather than throwing, so the file still attaches with `width/height=null`.
+- Image-only for v1: `accept={ image: true, video: false }`. Video upload UI deferred.
+- Default `maxImageBytes` is **8 MB** (was 100 MB).
+- Preview UI: large `aspect-video object-cover` image with a hover-revealed `Trash2` delete button (`group-hover:inline-flex`).
+- Accepts a `disabled?: boolean` prop that no-ops all click/drag handlers and dims the dropzone.
+
+### 16.6 Submission — upload deferred to confirm time (supersedes §11)
+
+The upload no longer fires when a file is dropped. Instead:
+
+1. User picks an image → stored locally as `SelectedMediaFile` (blob URL preview).
+2. User clicks Publish / Schedule → confirmation modal opens.
+3. On modal confirm: `uploadMediaIfPresent()` POSTs the file to `/api/posts/media`, then the publish/schedule mutation fires with the returned `media_id`.
+4. Modal "pending" state is `uploadMutation.isPending || publishMutation.isPending`.
+
+This means failed validations / cancelled modals never touch the API. Blob URLs are revoked on remove/reset/success.
+
+### 16.7 Error handling (supersedes §12)
+
+`api/client.ts::parseErrorDetail` now handles three FastAPI detail shapes:
+
+- Array of `{loc, msg, type}` → joined as `loc: msg; …` (existing).
+- Plain string → returned verbatim (existing).
+- **Object with `message: string`** → `message` returned (new). This is the shape `SocialPublishValidationError` raises, e.g. `{error_code, message, media_index}`. Previously fell through to the generic "Validation error (422)".
+
+Both `ConfirmPublishModal` and `ScheduleModal` render the error banner at the **top** of the modal body, not at the bottom, so the message is visible immediately when the modal opens.
+
+### 16.8 Hashtag highlight — letter-required (refinement to §7)
+
+`hashtagHighlight` ProseMirror plugin (`frontend/src/components/socialPosts/hashtagHighlight.ts`) now requires at least one letter for `#` matches, matching Facebook's/Instagram's actual auto-link rule:
+
+```
+/(?:#(?=[\p{L}\p{N}_]*\p{L})|@)[\p{L}\p{N}_]+/gu
+```
+
+`#111` is not highlighted (FB/IG won't link pure-numeric tags); `#test111` is. `@mentions` are unchanged (no letter requirement — can't validate users client-side).
+
+### 16.9 Backend — Instagram `is_primary` paired with Facebook
+
+A backend bug fix that lands alongside the composer:
+
+- `_instagram_account` in `src/services/meta_social_service.py` had a hardcoded `is_primary=False`. Now takes an `is_primary` arg, mirroring `_facebook_account`.
+- `_upsert_pages` passes the same `is_primary=(index == 0)` flag to both the Facebook page and its Instagram account, so the IG account belonging to the primary FB page is the primary IG.
+- Existing tenant DBs need a reconnect from Settings → Accounts (or a manual SQL update) — the bug left every IG account with `is_primary=false`.
+
+This is what unlocks the `disabled` health state (§16.1) actually transitioning to `connected` once a connection is re-synced.

@@ -2822,3 +2822,128 @@ Open items inherited from spec §15 are handled inline in the relevant tasks:
 - Date library — Task 7 uses `Intl.DateTimeFormat` only, no new dependency.
 - Lucide icon for Sidebar — Task 22 uses an icon already in scope (uses the Automation parent's icon; Social Media child has no per-item icon, matching the existing children pattern).
 - Backend schema field names — Task 2 step 1 reads `src/schemas/posts.py` before defining the TS types.
+
+---
+
+## Revisions after initial build
+
+These deltas were introduced during/after the first end-to-end build and supersede earlier task descriptions where they overlap. Cross-reference: spec §16 (matching section in the design doc).
+
+### R1 — Task 1: `UploadedMediaFile` → `SelectedMediaFile`
+
+Type renamed and reshaped. The previous "uploaded" semantics implied an already-uploaded record; the field now holds the locally-selected file plus its blob preview, with upload deferred to confirm time (see R5). Final shape in `frontend/src/types/media.ts`:
+
+```ts
+export interface SelectedMediaFile {
+  file: File;
+  previewUrl: string;
+  kind: UploadedMediaKind;
+  width: number | null;
+  height: number | null;
+  sizeBytes: number;
+}
+```
+
+Re-export updated in `frontend/src/types/index.ts`.
+
+### R2 — Tasks 4 & 5: Validation rules expanded, caption simplified
+
+`validateCompose` and its tests now reflect:
+
+- **Caption**: required (empty → "Write a caption."). The earlier "caption OR image" rule was dropped.
+- **Image type allow-list**: `image/jpeg | image/png | image/gif`; otherwise error "Image must be JPEG, PNG, or GIF."
+- **IG MIME**: when Instagram is selected, MIME must be exactly `image/jpeg`; otherwise error "Instagram only accepts JPEG. Convert the image before publishing."
+- **IG aspect ratio**: `width/height ∈ [0.8, 1.91]` is enforced as an **error** (previously a cosmetic warning).
+- **Image size**: cap is **8 MB** (was 100 MB) — matches backend `SOCIAL_MAX_IMAGE_BYTES`.
+
+Tests: `frontend/src/lib/socialPostValidation.test.ts` now has 15 cases including PNG-on-IG rejection and the 8 MB cap.
+
+A `groupErrorsByField(result)` helper was added so `ComposeTab` can render per-field error lists with `<FieldErrors>` (see R7).
+
+### R3 — Task 10: `MediaDropZone` simplified to pure selector
+
+Props removed: `uploadFn`, `state`, `errorMessage`. The component no longer owns upload state. It:
+
+- Builds a `SelectedMediaFile` on file pick / drop via `URL.createObjectURL` + `readImageDimensionsSafe` (resolves to `null` on decode error rather than throwing — relevant for tiny synthetic test files).
+- Image-only for v1 (`accept={ image: true, video: false }`); video deferred.
+- Default `maxImageBytes` is **8 MB**.
+- Preview UI: large `aspect-video object-cover` image with a hover-revealed `Trash2` delete button (`group-hover:inline-flex`).
+- Accepts `disabled?: boolean` — no-ops all click/drag handlers and dims the dropzone (used by R6).
+
+### R4 — Tasks 18, 19: Error banner moved to top of modal
+
+Both `ConfirmPublishModal` and `ScheduleModal` render `errorMessage` at the **top** of the modal body (above the platform chips / schedule form), not the bottom. The message is visible immediately when the modal opens with an error.
+
+### R5 — Task 20: `useForm` hook, deferred upload, `disabled` prop
+
+`ComposeTab` no longer uses raw `useState` for form state. A new reusable hook `frontend/src/hooks/useForm.ts` (built on React 19's `useActionState`) owns:
+
+- `values`, `errors`, `submitError`
+- per-field `dirtyFields` and `touchedFields`
+- derived `isDirty`, `isValid`, `isSubmitAttempted`, `isSubmitting`
+- helpers `setValues`, `reset`, `markFieldDirty`, `markFieldTouched`, `markSubmitAttempted`, `getFieldErrors`, `shouldShowFieldErrors`, `submit`, `formAction`
+
+Field error visibility rule: a field's errors render only when `isSubmitAttempted || (dirtyFields[field] && touchedFields[field])`. Per-field, not whole-form `isDirty`.
+
+Upload is **deferred to confirm time**: `MediaDropZone` returns a `SelectedMediaFile` (blob URL only). On modal confirm, `uploadMediaIfPresent()` POSTs to `/api/posts/media`, then the publish/schedule mutation fires with the returned `media_id`. Modal "pending" = `uploadMutation.isPending || publishMutation.isPending`. Failed validations / cancelled modals never touch the API. Blob URLs are revoked on remove/reset/success.
+
+`ComposeTab` accepts a `disabled?: boolean` prop and propagates it to `CaptionField` (tiptap `editable=false` + greyed styling) and `MediaDropZone`. When true, `canPublish = false` and all field error messages are suppressed.
+
+### R6 — Task 21: `disabled` propagation + `disabled` health value
+
+`SocialPostsPage.derivePlatformHealth` now distinguishes a fourth state: `"disabled"`.
+
+```
+PlatformHealth = "connected" | "unhealthy" | "disconnected" | "disabled"
+```
+
+Derivation:
+1. No connection → `disconnected`
+2. No account of that platform → `disconnected`
+3. **Instagram only**: account(s) exist but none `is_primary` → `disabled` (Facebook is exempt — its sync always marks the first page primary)
+4. Selected account not `authorized` → `unhealthy`
+5. Else → `connected`
+
+`ChannelChip` adds a tooltip entry for `disabled`: "No primary Instagram account — set one in Accounts." It greys out for any non-`connected` value (existing behavior).
+
+`SocialPostsPage` passes `disabled={noPlatformsConnected}` to `ComposeTab` so the whole form greys out when nothing is publishable.
+
+### R7 — New file: `FieldErrors` common component
+
+`frontend/src/components/common/FieldErrors.tsx` renders a `<ul>` of red `<li>` messages, returns `null` when the array is empty. Used inline under each input in `ComposeTab` after R5.
+
+### R8 — Task 16: `AccountsConnectBanner` link
+
+Final link target is `/integrations?tab=meta`, not `/integrations`. The Integrations page reads the `tab` query param via `useSearchParams`.
+
+### R9 — API client: structured error detail support
+
+`frontend/src/api/client.ts::parseErrorDetail` handles a third FastAPI detail shape:
+
+- Array `{loc, msg, type}` → joined (existing FastAPI 422 shape)
+- Plain string → returned verbatim (existing)
+- **Object with `message: string`** → `message` returned (new — used by `SocialPublishValidationError`'s `{error_code, message, media_index}` payload). Without this, the modal showed "Validation error (422)" instead of the explicit backend message.
+
+### R10 — `hashtagHighlight` regex tightened
+
+`frontend/src/components/socialPosts/hashtagHighlight.ts` regex updated to require at least one letter after `#`, matching FB/IG's actual auto-link rule:
+
+```
+/(?:#(?=[\p{L}\p{N}_]*\p{L})|@)[\p{L}\p{N}_]+/gu
+```
+
+`#111` is not highlighted (FB won't link pure-numeric); `#test111` is. `@mentions` unchanged.
+
+### R11 — Backend: Instagram `is_primary` paired with Facebook
+
+Out-of-band backend fix landed alongside the composer (not a plan task, but mandatory for R6's `disabled` state to ever transition to `connected`):
+
+- `_instagram_account` in `src/services/meta_social_service.py` had a hardcoded `is_primary=False`. Now takes `is_primary` as a parameter.
+- `_upsert_pages` passes the same `is_primary=(index == 0)` flag to both the FB page and its IG account, so the IG account belonging to the primary FB page is the primary IG.
+- Existing tenant DBs need a reconnect from Settings → Accounts (or a manual SQL update) — the bug had left every IG account with `is_primary=false`.
+
+### R12 — Tests / infra deltas
+
+- `frontend/vitest.config.ts` excludes `tests/**` so Playwright specs don't get picked up by Vitest.
+- `frontend/.gitignore` covers `test-results/`, `playwright-report/`, `blob-report/`, `playwright/.cache/`.
+- Phase 11 E2E tasks (Tasks 23–25) were removed from the plan earlier in the build; backend coverage lives as plain integration tests under `tests/integration/test_api_posts_publish.py` and `test_api_posts_schedule.py` (already noted in the self-review summary above).
